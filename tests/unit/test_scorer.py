@@ -6,7 +6,12 @@ import unicodedata
 import numpy as np
 import pytest
 
-from app.schemas.allocation import AlternativePlacement, ScoreBreakdown, ScoringWeights
+from app.schemas.allocation import (
+    AlternativePlacement,
+    LockedOverride,
+    ScoreBreakdown,
+    ScoringWeights,
+)
 from app.schemas.candidate import CandidateForAllocation, CandidateMetadata, ParsedCV
 from app.schemas.position import FacetedVectors, PositionForAllocation
 from app.services import scorer as scorer_module
@@ -22,6 +27,10 @@ from app.services.scorer import (
 def _make_candidate(
     candidate_id: str = "c1",
     *,
+    city: str | None = None,
+    program: str = "",
+    field: str = "",
+    major: str = "",
     technical_skills: list[str] | None = None,
     additional_info: str = "",
     skills: list[str] | None = None,
@@ -30,7 +39,6 @@ def _make_candidate(
     projects_summary: str = "",
     certifications: list[str] | None = None,
     languages: list[str] | None = None,
-    major: str = "",
     skills_vec: list[float] | None = None,
     academic_vec: list[float] | None = None,
     practical_vec: list[float] | None = None,
@@ -39,9 +47,12 @@ def _make_candidate(
         candidate_id=candidate_id,
         metadata=CandidateMetadata(
             candidate_id=candidate_id,
+            city=city,
+            program=program,
+            field=field,
+            major=major,
             technical_skills=technical_skills or [],
             additional_info=additional_info,
-            major=major,
         ),
         parsed_cv=ParsedCV(
             skills=skills or [],
@@ -335,30 +346,47 @@ class TestLexicalCoverage:
         result = score_pairs([cand], [pos])
         assert result.required_skills_lexical[0, 0] == pytest.approx(0.5)
         assert result.preferred_skills_lexical[0, 0] == pytest.approx(0.5)
-        # Default weights: 0.20 * 0.5 + 0.10 * 0.5 = 0.15
-        assert result.total_scores[0, 0] == pytest.approx(0.15)
+        # Active components: required (0.20) + preferred (0.10) = 0.30.
+        # Total = (0.20 * 0.5 + 0.10 * 0.5) / 0.30 = 0.50.
+        assert result.total_scores[0, 0] == pytest.approx(0.50)
 
-        # Verify required carries higher default weight than preferred.
-        pos_req_only = _make_position(
+        # Verify required carries higher weight than preferred when both skill lists are active.
+        pos_req_match = _make_position(
             "p_req",
             required_skills=["Python"],
-            preferred_skills=[],
+            preferred_skills=["Go"],
             skills_vec=[0.0, 0.0, 0.0],
             academic_vec=[0.0, 0.0, 0.0],
             practical_vec=[0.0, 0.0, 0.0],
         )
-        pos_pref_only = _make_position(
+        pos_pref_match = _make_position(
             "p_pref",
-            required_skills=[],
+            required_skills=["Go"],
             preferred_skills=["Python"],
             skills_vec=[0.0, 0.0, 0.0],
             academic_vec=[0.0, 0.0, 0.0],
             practical_vec=[0.0, 0.0, 0.0],
         )
-        res_cmp = score_pairs([cand], [pos_req_only, pos_pref_only])
-        assert res_cmp.total_scores[0, 0] == pytest.approx(0.20)
-        assert res_cmp.total_scores[0, 1] == pytest.approx(0.10)
+        res_cmp = score_pairs([cand], [pos_req_match, pos_pref_match])
+        assert res_cmp.total_scores[0, 0] == pytest.approx(0.20 / 0.30)
+        assert res_cmp.total_scores[0, 1] == pytest.approx(0.10 / 0.30)
         assert res_cmp.total_scores[0, 0] > res_cmp.total_scores[0, 1]
+
+        # Same check with all 5 position components active (candidate semantic vectors = 0).
+        pos_req_full = _make_position(
+            "p_req_full",
+            required_skills=["Python"],
+            preferred_skills=["Go"],
+        )
+        pos_pref_full = _make_position(
+            "p_pref_full",
+            required_skills=["Go"],
+            preferred_skills=["Python"],
+        )
+        res_full = score_pairs([cand], [pos_req_full, pos_pref_full])
+        assert res_full.total_scores[0, 0] == pytest.approx(0.20)
+        assert res_full.total_scores[0, 1] == pytest.approx(0.10)
+        assert res_full.total_scores[0, 0] > res_full.total_scores[0, 1]
 
     def test_boundary_safe_tech_symbols_and_no_false_substring_hits(self):
         cand_tricky = _make_candidate(
@@ -402,14 +430,13 @@ class TestLexicalCoverage:
         assert res.required_skills_lexical[1, 0] == pytest.approx(3 / 5)
         assert res.required_skills_lexical[1, 1] == pytest.approx(1.0)
 
-    def test_arabic_normalization_deduplication_and_corpus_boundaries(self):
+    def test_arabic_normalization_deduplication_and_segment_isolation(self):
         cand_ar = _make_candidate(
             "c_ar",
+            city="Damascus",
             technical_skills=["بايثُون", "Data"],
             skills=["Science"],
             experience_summary="خبرة في امن   المعلومات وتحليل البيانات.",
-            education_summary="Java and Rust should not come from education_summary",
-            languages=["French"],
             skills_vec=[0.0, 0.0, 0.0],
             academic_vec=[0.0, 0.0, 0.0],
             practical_vec=[0.0, 0.0, 0.0],
@@ -425,15 +452,67 @@ class TestLexicalCoverage:
             ],
             preferred_skills=[
                 "Data Science",  # must NOT match across separate technical_skills/skills items
-                "Rust",  # must NOT match education_summary
-                "French",  # must NOT match languages
+                "Damascus",  # city must NOT be part of lexical corpus
             ],
         )
 
         res = score_pairs([cand_ar], [pos_ar])
-        # Deduplicated required skills = {"بايثون", "امن المعلومات", "برمجة"} -> 2/3 matched.
+        # Deduplicated required skills = {"بايثون", "امن المعلومات", "برمجه"} -> 2/3 matched.
         assert res.required_skills_lexical[0, 0] == pytest.approx(2 / 3)
         assert res.preferred_skills_lexical[0, 0] == 0.0
+
+    def test_languages_and_education_summary_lexical_matching(self):
+        cand = _make_candidate(
+            "c_full_corpus",
+            city="Aleppo",
+            program="Undergraduate",
+            field="Information Technology",
+            major="Software Engineering",
+            education_summary="BSc Computer Engineering with Machine Learning and SQL coursework.",
+            languages=["English", "French"],
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[0.0, 0.0, 0.0],
+            practical_vec=[0.0, 0.0, 0.0],
+        )
+        pos = _make_position(
+            "p_full_corpus",
+            required_skills=["French", "Machine Learning", "Computer Engineering", "SQL"],
+            preferred_skills=["English", "Software Engineering", "Aleppo"],
+        )
+
+        res = score_pairs([cand], [pos])
+        assert res.required_skills_lexical[0, 0] == pytest.approx(1.0)
+        # Matches "English" (languages) and "Software Engineering" (major); excludes "Aleppo" (city).
+        assert res.preferred_skills_lexical[0, 0] == pytest.approx(2 / 3)
+
+    def test_arabic_teh_marbuta_and_alef_maksura_variants(self):
+        cand = _make_candidate(
+            "c_ar_variants",
+            technical_skills=["تقنى", "معلوماتيه"],
+            education_summary="بكالوريوس هندسه البرمجيات",
+            experience_summary="إدارة قواعد البيانات والأنظمة الذكية.",
+            languages=["العربيه"],
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[0.0, 0.0, 0.0],
+            practical_vec=[0.0, 0.0, 0.0],
+        )
+        pos = _make_position(
+            "p_ar_variants",
+            required_skills=[
+                "تقني",
+                "تقنى",  # duplicates "تقني" after ى/ي unification
+                "هندسة البرمجيات",
+                "اداره قواعد البيانات",
+                "العربية",
+            ],
+            preferred_skills=["معلوماتية", "برمجه"],
+        )
+
+        res = score_pairs([cand], [pos])
+        # Deduplicated required skills: 4 items, all 4 matched via ة/ه and ى/ي normalization.
+        assert res.required_skills_lexical[0, 0] == pytest.approx(1.0)
+        # Preferred: "معلوماتية" matches "معلوماتيه", "برمجه" absent -> 1/2.
+        assert res.preferred_skills_lexical[0, 0] == pytest.approx(0.5)
 
     def test_compound_separator_boundary_traps(self):
         cand = _make_candidate(
@@ -480,6 +559,141 @@ class TestLexicalCoverage:
         res = score_pairs([cand], [pos])
         assert res.required_skills_lexical[0, 0] == pytest.approx(1.0)
         assert res.preferred_skills_lexical[0, 0] == pytest.approx(1.0)
+
+
+class TestActiveWeightRenormalization:
+    def test_preferred_skills_empty_reaches_one_with_raw_subscores(self):
+        cand = _make_candidate(
+            "c1",
+            technical_skills=["Python"],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+        pos = _make_position(
+            "p_no_pref",
+            required_skills=["Python"],
+            preferred_skills=[],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+
+        res = score_pairs([cand], [pos])
+        assert res.total_scores[0, 0] == pytest.approx(1.0)
+        bd = res.breakdown(0, 0)
+        assert bd.skills_semantic == pytest.approx(1.0)
+        assert bd.academic_semantic == pytest.approx(1.0)
+        assert bd.practical_semantic == pytest.approx(1.0)
+        assert bd.required_skills_lexical == pytest.approx(1.0)
+        assert bd.preferred_skills_lexical == 0.0
+
+    def test_empty_skill_lists_and_zero_skills_vec_clears_threshold_and_reaches_one(self):
+        cand = _make_candidate(
+            "c1",
+            technical_skills=["Python"],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[0.0, 1.0, 0.0],
+        )
+        pos = _make_position(
+            "p_academic_practical_only",
+            required_skills=[],
+            preferred_skills=[],
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[0.0, 1.0, 0.0],
+        )
+
+        res = score_pairs([cand], [pos])
+        assert res.total_scores[0, 0] == pytest.approx(1.0)
+        assert res.total_scores[0, 0] >= 0.45
+
+        # Sub-score matrices remain raw and uninflated.
+        bd = res.breakdown(0, 0)
+        assert bd.skills_semantic == 0.0
+        assert bd.academic_semantic == pytest.approx(1.0)
+        assert bd.practical_semantic == pytest.approx(1.0)
+        assert bd.required_skills_lexical == 0.0
+        assert bd.preferred_skills_lexical == 0.0
+
+        graph = prune_sparse_graph(
+            res, np.array([[True]], dtype=bool), min_match_threshold=0.45
+        )
+        assert len(graph.edges) == 1
+        assert graph.edges[0].scaled_weight == 10_000
+
+    def test_all_empty_position_or_zero_active_weight_sum_returns_zero(self):
+        cand = _make_candidate(
+            "c1",
+            technical_skills=["Python"],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+        pos_all_empty = _make_position(
+            "p_empty",
+            required_skills=[],
+            preferred_skills=["   "],
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[0.0, 0.0, 0.0],
+            practical_vec=[0.0, 0.0, 0.0],
+        )
+
+        res = score_pairs([cand], [pos_all_empty])
+        assert res.total_scores[0, 0] == 0.0
+        assert math.isfinite(float(res.total_scores[0, 0]))
+
+        # Active component whose configured weight is 0.0 also yields active sum 0.0 -> 0.0.
+        pos_pref_only = _make_position(
+            "p_pref_only",
+            required_skills=[],
+            preferred_skills=["Python"],
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[0.0, 0.0, 0.0],
+            practical_vec=[0.0, 0.0, 0.0],
+        )
+        zero_pref_weights = ScoringWeights(
+            skills_semantic=1.0,
+            academic_semantic=0.0,
+            practical_semantic=0.0,
+            required_skills_lexical=0.0,
+            preferred_skills_lexical=0.0,
+        )
+        res_zero_active_weight = score_pairs(
+            [cand], [pos_pref_only], weights=zero_pref_weights
+        )
+        assert res_zero_active_weight.total_scores[0, 0] == 0.0
+
+    def test_candidate_side_empty_fields_are_never_renormalized_and_remain_penalized(self):
+        cand_sparse = _make_candidate(
+            "c_sparse",
+            skills_vec=[0.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+        pos_full = _make_position(
+            "p_full",
+            required_skills=["Python"],
+            preferred_skills=["Docker"],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+        pos_no_pref = _make_position(
+            "p_no_pref",
+            required_skills=["Python"],
+            preferred_skills=[],
+            skills_vec=[1.0, 0.0, 0.0],
+            academic_vec=[1.0, 0.0, 0.0],
+            practical_vec=[1.0, 0.0, 0.0],
+        )
+
+        res = score_pairs([cand_sparse], [pos_full, pos_no_pref])
+        # Only academic (0.15) and practical (0.20) match; missing candidate skills_vec/lexical are penalized.
+        assert res.total_scores[0, 0] == pytest.approx(0.35)
+        # pos_no_pref renormalizes only for position-side missing preferred_skills (active sum = 0.90).
+        assert res.total_scores[0, 1] == pytest.approx(0.35 / 0.90)
 
 
 class TestScoringResultAuditHelpers:
@@ -637,6 +851,7 @@ class TestPruneSparseGraph:
             score=0.81235,
             scaled_weight=int(round(0.81235 * 10_000)),
             breakdown=scoring.breakdown(0, 3),
+            is_locked=False,
         )
         assert c0_edges[1].scaled_weight == 4500
 
@@ -729,3 +944,154 @@ class TestPruneSparseGraph:
         assert graph.edges_by_candidate[0][0].position_idx == 1
         assert graph.edges_by_candidate[0][0].position_id == "p1"
         assert graph.edges_by_candidate[0][0].scaled_weight == 7500
+
+    def test_locked_overrides_force_retains_ineligible_and_below_threshold_edges(self):
+        scores = np.array(
+            [
+                [0.80, 0.10],  # c0: all ineligible, locked to p0
+                [0.20, 0.90],  # c1: p0 eligible but < 0.45, p1 ineligible, locked to p0
+                [0.70, 0.10],  # c2: p0 eligible & >= 0.45, p1 ineligible & < 0.45, locked to p1
+            ],
+            dtype=np.float64,
+        )
+        elig = np.array(
+            [
+                [False, False],
+                [True, False],
+                [True, False],
+            ],
+            dtype=bool,
+        )
+        scoring = self._custom_scoring(scores)
+        overrides = [
+            LockedOverride(candidate_id="c0", position_id="p0"),
+            LockedOverride(candidate_id="c1", position_id="p0"),
+            LockedOverride(candidate_id="c2", position_id="p1"),
+        ]
+
+        graph = prune_sparse_graph(
+            scoring,
+            elig,
+            min_match_threshold=0.45,
+            top_k_per_candidate=5,
+            locked_overrides=overrides,
+        )
+
+        # Diagnostics must reflect true eligibility and threshold status, ignoring locks.
+        assert graph.has_eligible_position == (False, True, True)
+        assert graph.has_above_threshold_position == (False, False, True)
+
+        assert len(graph.edges_by_candidate[0]) == 1
+        assert graph.edges_by_candidate[0][0].position_id == "p0"
+        assert graph.edges_by_candidate[0][0].is_locked is True
+        assert graph.edges_by_candidate[0][0].scaled_weight == 8000
+
+        assert len(graph.edges_by_candidate[1]) == 1
+        assert graph.edges_by_candidate[1][0].position_id == "p0"
+        assert graph.edges_by_candidate[1][0].is_locked is True
+        assert graph.edges_by_candidate[1][0].scaled_weight == 2000
+
+        assert [(e.position_id, e.is_locked) for e in graph.edges_by_candidate[2]] == [
+            ("p0", False),
+            ("p1", True),
+        ]
+
+    def test_locked_overrides_retains_outside_top_k_without_dropping_top_k_or_duplicating(self):
+        scores = np.array(
+            [
+                [0.90, 0.80, 0.60],  # c0 locked to p2 (outside top-2)
+                [0.90, 0.80, 0.60],  # c1 locked to p0 (already in top-2)
+            ],
+            dtype=np.float64,
+        )
+        elig = np.array(
+            [
+                [True, True, True],
+                [True, True, True],
+            ],
+            dtype=bool,
+        )
+        scoring = self._custom_scoring(scores)
+        overrides = [
+            LockedOverride(candidate_id="c0", position_id="p2"),
+            LockedOverride(candidate_id="c1", position_id="p0"),
+        ]
+
+        graph = prune_sparse_graph(
+            scoring,
+            elig,
+            min_match_threshold=0.45,
+            top_k_per_candidate=2,
+            locked_overrides=overrides,
+        )
+
+        # c0 keeps both real top-2 edges (p0, p1) AND force-retained p2.
+        assert [(e.position_id, e.is_locked) for e in graph.edges_by_candidate[0]] == [
+            ("p0", False),
+            ("p1", False),
+            ("p2", True),
+        ]
+        # c1 does not duplicate p0 and marks it is_locked=True.
+        assert [(e.position_id, e.is_locked) for e in graph.edges_by_candidate[1]] == [
+            ("p0", True),
+            ("p1", False),
+        ]
+
+    def test_locked_overrides_deduplicates_identical_and_allows_shared_position(self):
+        scores = np.array([[0.80, 0.70], [0.60, 0.50]], dtype=np.float64)
+        elig = np.array([[True, True], [True, True]], dtype=bool)
+        scoring = self._custom_scoring(scores)
+        overrides = [
+            LockedOverride(candidate_id="c0", position_id="p0"),
+            LockedOverride(candidate_id="c0", position_id="p0"),
+            LockedOverride(candidate_id="c1", position_id="p0"),
+        ]
+
+        graph = prune_sparse_graph(
+            scoring,
+            elig,
+            min_match_threshold=0.45,
+            top_k_per_candidate=2,
+            locked_overrides=overrides,
+        )
+        assert [(e.position_id, e.is_locked) for e in graph.edges_by_candidate[0]] == [
+            ("p0", True),
+            ("p1", False),
+        ]
+        assert [(e.position_id, e.is_locked) for e in graph.edges_by_candidate[1]] == [
+            ("p0", True),
+            ("p1", False),
+        ]
+
+    def test_locked_overrides_validation_errors(self):
+        scores = np.array([[0.80, 0.70]], dtype=np.float64)
+        elig = np.array([[True, True]], dtype=bool)
+        scoring = self._custom_scoring(scores)
+
+        with pytest.raises(ValueError, match="Unknown candidate_id"):
+            prune_sparse_graph(
+                scoring,
+                elig,
+                locked_overrides=[LockedOverride(candidate_id="missing", position_id="p0")],
+            )
+        with pytest.raises(ValueError, match="Unknown position_id"):
+            prune_sparse_graph(
+                scoring,
+                elig,
+                locked_overrides=[LockedOverride(candidate_id="c0", position_id="missing")],
+            )
+        with pytest.raises(ValueError, match="Conflicting locked_overrides"):
+            prune_sparse_graph(
+                scoring,
+                elig,
+                locked_overrides=[
+                    LockedOverride(candidate_id="c0", position_id="p0"),
+                    LockedOverride(candidate_id="c0", position_id="p1"),
+                ],
+            )
+        with pytest.raises(ValueError, match="LockedOverride"):
+            prune_sparse_graph(
+                scoring,
+                elig,
+                locked_overrides=["c0"],  # type: ignore[list-item]
+            )

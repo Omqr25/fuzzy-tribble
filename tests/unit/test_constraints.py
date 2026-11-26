@@ -9,6 +9,7 @@ from app.schemas.position import (
     PositionConstraints,
     PositionForAllocation,
 )
+import app.services.constraints as constraints_module
 from app.services.constraints import (
     DisqualificationReason,
     EligibilityResult,
@@ -82,6 +83,30 @@ class TestAllowedCitiesRule:
         )
         assert result.eligibility_matrix.tolist() == [[True], [True], [True], [False]]
         assert result.disqualifications[(3, 0)][0].rule == "allowed_cities"
+
+    def test_city_matches_teh_marbuta_and_alef_maksura_variants(self):
+        c_latakia_h = _candidate("c1", city="اللاذقيه")
+        c_latakia_t = _candidate("c2", city="اللاذقية")
+        c_hama_h = _candidate("c3", city="حماه")
+        c_hama_t = _candidate("c4", city="حماة")
+        c_salma_y = _candidate("c5", city="سلمي")
+        c_other = _candidate("c6", city="حمص")
+
+        pos_t = _position("p1", allowed_cities=["اللاذقية", "حماة", "سلمى"])
+        pos_h = _position("p2", allowed_cities=["اللاذقيه", "حماه", "سلمي"])
+
+        result = evaluate_eligibility(
+            [c_latakia_h, c_latakia_t, c_hama_h, c_hama_t, c_salma_y, c_other],
+            [pos_t, pos_h],
+        )
+        assert result.eligibility_matrix.tolist() == [
+            [True, True],
+            [True, True],
+            [True, True],
+            [True, True],
+            [True, True],
+            [False, False],
+        ]
 
 
 class TestMinGpaRule:
@@ -208,6 +233,30 @@ class TestRequiredMajorsRule:
             [False, False],
         ]
 
+    def test_major_matches_teh_marbuta_and_alef_maksura_variants(self):
+        c_eng_h = _candidate("c1", major="هندسه البرمجيات")
+        c_info_h = _candidate("c2", major="معلوماتيه")
+        c_both_t = _candidate("c3", major="بكالوريوس في هندسة معلوماتية")
+        c_fallback_h = _candidate("c4", major="  ", field="معلوماتيه")
+        c_alef_maksura = _candidate("c5", major="نظم تقنى")
+        c_unrelated = _candidate("c6", major="محاسبة")
+
+        pos_t = _position("p1", required_majors=["هندسة", "معلوماتية", "تقني"])
+        pos_h = _position("p2", required_majors=["هندسه", "معلوماتيه", "تقنى"])
+
+        result = evaluate_eligibility(
+            [c_eng_h, c_info_h, c_both_t, c_fallback_h, c_alef_maksura, c_unrelated],
+            [pos_t, pos_h],
+        )
+        assert result.eligibility_matrix.tolist() == [
+            [True, True],
+            [True, True],
+            [True, True],
+            [True, True],
+            [True, True],
+            [False, False],
+        ]
+
 
 class TestMustHaveKeywordsRule:
     def test_empty_or_blank_keywords_always_passes(self):
@@ -317,6 +366,113 @@ class TestMustHaveKeywordsRule:
         result = evaluate_eligibility([cand], [pos])
         assert bool(result.eligibility_matrix[0, 0]) is True
 
+    def test_keywords_match_teh_marbuta_and_alef_maksura_variants(self):
+        c_variants = _candidate(
+            "c1",
+            technical_skills=["دعم تقنى"],
+            cv={
+                "experience_summary": "خبره في هندسه الشبكات ونظم معلوماتيه في اللاذقيه",
+            },
+        )
+        c_reverse = _candidate(
+            "c2",
+            technical_skills=["دعم تقني"],
+            cv={
+                "experience_summary": "خبرة في هندسة نظم معلوماتية في اللاذقية",
+            },
+        )
+        c_mismatch = _candidate("c3", technical_skills=["تقنيه"])
+
+        pos_standard = _position(
+            "p1",
+            must_have_keywords=["تقني", "هندسة", "معلوماتية", "اللاذقية"],
+        )
+        pos_alt = _position(
+            "p2",
+            must_have_keywords=["تقنى", "هندسه", "معلوماتيه", "اللاذقيه"],
+        )
+
+        result = evaluate_eligibility(
+            [c_variants, c_reverse, c_mismatch],
+            [pos_standard, pos_alt],
+        )
+        assert result.eligibility_matrix.tolist() == [
+            [True, True],
+            [True, True],
+            [False, False],
+        ]
+
+    def test_caches_keyword_matching_across_positions_sharing_keywords(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        c_match = _candidate(
+            "c0",
+            technical_skills=["Python"],
+            cv={"experience_summary": "Built APIs with دعم تقني."},
+        )
+        c_miss = _candidate("c1", technical_skills=["Go"])
+
+        shared_positions = [
+            _position("p0", must_have_keywords=["Python", "تقني", "Docker"]),
+            _position("p1", must_have_keywords=["python", "تقنى", "Docker"]),
+            _position("p2", must_have_keywords=["PYTHON", "تقني"]),
+            _position("p3", must_have_keywords=["Python", "Docker"]),
+        ]
+        union_position = [
+            _position("p_union", must_have_keywords=["Python", "تقني", "Docker"])
+        ]
+
+        orig_contains_phrase = constraints_module.contains_phrase
+        orig_compile_pattern = constraints_module.compile_phrase_pattern
+        contains_calls: list[tuple[str, str]] = []
+        compile_calls: list[str] = []
+
+        def spy_contains_phrase(normalized_text, pattern, normalized_phrase):
+            contains_calls.append((normalized_text, normalized_phrase))
+            return orig_contains_phrase(normalized_text, pattern, normalized_phrase)
+
+        def spy_compile_pattern(normalized_phrase):
+            compile_calls.append(normalized_phrase)
+            return orig_compile_pattern(normalized_phrase)
+
+        monkeypatch.setattr(constraints_module, "contains_phrase", spy_contains_phrase)
+        monkeypatch.setattr(
+            constraints_module, "compile_phrase_pattern", spy_compile_pattern
+        )
+
+        union_result = evaluate_eligibility([c_match, c_miss], union_position)
+        union_contains_count = len(contains_calls)
+        assert compile_calls == ["python", "تقني", "docker"]
+
+        contains_calls.clear()
+        compile_calls.clear()
+
+        result = evaluate_eligibility([c_match, c_miss], shared_positions)
+
+        assert union_result.eligibility_matrix.tolist() == [[False], [False]]
+        assert result.eligibility_matrix.tolist() == [
+            [False, False, True, False],
+            [False, False, False, False],
+        ]
+        assert result.reasons_for_pair(0, 0) == ["Missing required keywords: Docker."]
+        assert result.reasons_for_pair(0, 1) == ["Missing required keywords: Docker."]
+        assert result.reasons_for_pair(0, 2) == []
+        assert result.reasons_for_pair(0, 3) == ["Missing required keywords: Docker."]
+        assert result.reasons_for_pair(1, 0) == [
+            "Missing required keywords: Python, تقني, Docker."
+        ]
+        assert result.reasons_for_pair(1, 1) == [
+            "Missing required keywords: python, تقنى, Docker."
+        ]
+        assert result.reasons_for_pair(1, 2) == [
+            "Missing required keywords: PYTHON, تقني."
+        ]
+        assert result.reasons_for_pair(1, 3) == [
+            "Missing required keywords: Python, Docker."
+        ]
+        assert compile_calls == ["python", "تقني", "docker"]
+        assert len(contains_calls) == union_contains_count
+
 
 class TestEligibilityResultContractAndValidation:
     def test_matrix_shape_dtype_and_multi_rule_disqualifications(self):
@@ -398,7 +554,50 @@ class TestEligibilityResultContractAndValidation:
         with pytest.raises(IndexError):
             result.reasons_for_pair(0, -1)
         with pytest.raises(IndexError):
+            result.reasons_for_pair(np.int64(1), 0)
+        with pytest.raises(IndexError):
+            result.reasons_for_pair(0, np.int64(-1))
+        with pytest.raises(IndexError):
             result.disqualification_summary_for_candidate(-1)
+        with pytest.raises(IndexError):
+            result.disqualification_summary_for_candidate(np.int64(-1))
+
+    def test_accepts_numpy_int64_indices(self):
+        c0 = _candidate("c0", city="Homs")
+        c1 = _candidate("c1", city="Damascus")
+        p0 = _position("p0", allowed_cities=["Damascus"])
+        p1 = _position("p1", allowed_cities=["Homs"])
+
+        result = evaluate_eligibility([c0, c1], [p0, p1])
+
+        assert result.reasons_for_pair(np.int64(0), np.int64(0)) == result.reasons_for_pair(0, 0)
+        assert len(result.reasons_for_pair(np.int64(0), np.int64(0))) == 1
+        assert result.reasons_for_pair(np.int64(0), 1) == []
+        assert result.reasons_for_pair(1, np.int64(1)) == result.reasons_for_pair(1, 1)
+        assert len(result.reasons_for_pair(1, np.int64(1))) == 1
+
+        assert result.disqualification_summary_for_candidate(np.int64(0)) == {
+            "p0": result.reasons_for_pair(0, 0)
+        }
+        assert result.disqualification_summary_for_candidate(np.int64(1)) == {
+            "p1": result.reasons_for_pair(1, 1)
+        }
+
+    @pytest.mark.parametrize(
+        "bad_index",
+        [True, False, np.bool_(True), np.bool_(False)],
+    )
+    def test_bool_indices_raise_index_error(self, bad_index: object):
+        result = evaluate_eligibility(
+            [_candidate("c1"), _candidate("c2")],
+            [_position("p1"), _position("p2")],
+        )
+        with pytest.raises(IndexError):
+            result.reasons_for_pair(bad_index, 0)  # type: ignore[arg-type]
+        with pytest.raises(IndexError):
+            result.reasons_for_pair(0, bad_index)  # type: ignore[arg-type]
+        with pytest.raises(IndexError):
+            result.disqualification_summary_for_candidate(bad_index)  # type: ignore[arg-type]
 
     def test_duplicate_ids_raise_value_error(self):
         with pytest.raises(ValueError, match="candidate_id"):

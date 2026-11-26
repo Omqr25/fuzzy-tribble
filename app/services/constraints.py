@@ -10,15 +10,19 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import re
-import unicodedata
 
 import numpy as np
 
 from app.schemas.candidate import CandidateForAllocation
 from app.schemas.position import PositionForAllocation
-from app.services.extractor import _normalize_arabic
-
-_WHITESPACE_RE = re.compile(r"\s+")
+from app.services.text_matching import (
+    build_candidate_corpus_segments,
+    compile_phrase_pattern,
+    contains_phrase,
+    dedupe_normalized_items,
+    normalize_text,
+    validate_index,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,36 +42,28 @@ class EligibilityResult:
     position_ids: tuple[str, ...]
     disqualifications: dict[tuple[int, int], list[DisqualificationReason]]
 
-    def _validate_candidate_index(self, candidate_idx: int) -> None:
-        if not (0 <= candidate_idx < len(self.candidate_ids)):
-            raise IndexError(
-                f"candidate_idx {candidate_idx} out of range for {len(self.candidate_ids)} candidates"
-            )
-
-    def _validate_position_index(self, position_idx: int) -> None:
-        if not (0 <= position_idx < len(self.position_ids)):
-            raise IndexError(
-                f"position_idx {position_idx} out of range for {len(self.position_ids)} positions"
-            )
-
-    def reasons_for_pair(self, candidate_idx: int, position_idx: int) -> list[str]:
+    def reasons_for_pair(
+        self,
+        candidate_idx: int | np.integer,
+        position_idx: int | np.integer,
+    ) -> list[str]:
         """Return disqualification messages for ``(candidate_idx, position_idx)``."""
-        self._validate_candidate_index(candidate_idx)
-        self._validate_position_index(position_idx)
+        cand_idx = validate_index(candidate_idx, len(self.candidate_ids), "candidate")
+        pos_idx = validate_index(position_idx, len(self.position_ids), "position")
         return [
             reason.message
-            for reason in self.disqualifications.get((candidate_idx, position_idx), ())
+            for reason in self.disqualifications.get((cand_idx, pos_idx), ())
         ]
 
     def disqualification_summary_for_candidate(
-        self, candidate_idx: int
+        self, candidate_idx: int | np.integer
     ) -> dict[str, list[str]]:
         """Return ``{position_id: [reasons]}`` for all ineligible positions."""
-        self._validate_candidate_index(candidate_idx)
+        cand_idx = validate_index(candidate_idx, len(self.candidate_ids), "candidate")
         summary: dict[str, list[str]] = {}
         for pos_idx, position_id in enumerate(self.position_ids):
-            if not self.eligibility_matrix[candidate_idx, pos_idx]:
-                summary[position_id] = self.reasons_for_pair(candidate_idx, pos_idx)
+            if not self.eligibility_matrix[cand_idx, pos_idx]:
+                summary[position_id] = self.reasons_for_pair(cand_idx, pos_idx)
         return summary
 
 
@@ -94,106 +90,55 @@ class _PreparedPosition:
     must_have_keywords: tuple[tuple[str, str, re.Pattern[str]], ...]
 
 
-def _normalize_text(text: str | None) -> str:
-    """Normalize text for deterministic Arabic/English comparison."""
-    if not text:
-        return ""
-    composed = unicodedata.normalize("NFC", text)
-    arabic_normalized = _normalize_arabic(composed)
-    collapsed = _WHITESPACE_RE.sub(" ", arabic_normalized).strip()
-    return collapsed.casefold()
+def _collapse_whitespace(text: str | None) -> str:
+    return " ".join((text or "").split())
 
 
-def _dedupe_normalized_items(items: Sequence[str]) -> tuple[tuple[str, str], ...]:
-    """Return ``(display_label, normalized_value)`` pairs, ignoring blanks."""
-    pairs: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for raw in items:
-        display = _WHITESPACE_RE.sub(" ", (raw or "")).strip()
-        norm = _normalize_text(display)
-        if not norm or norm in seen:
-            continue
-        seen.add(norm)
-        pairs.append((display, norm))
-    return tuple(pairs)
-
-
-def _compile_phrase_pattern(normalized_phrase: str) -> re.Pattern[str]:
-    """Compile a boundary-aware pattern supporting English, Arabic, and tech symbols.
-
-    Prevents partial token leaks (e.g. ``Java`` inside ``JavaScript``, ``C`` inside
-    ``Computer`` or ``C++``, ``R`` inside ``Docker`` or ``R&D``, ``.NET`` inside
-    ``ASP.NET``) while allowing sentence-ending punctuation such as ``Python.`` and
-    slash-separated tokens such as ``C/C++``.
-    """
-    escaped = re.escape(normalized_phrase)
-    return re.compile(
-        rf"(?<![\w+#.])(?<![\w+#][&-]){escaped}(?![\w+#]|[.&-][\w+#])"
-    )
-
-
-def _contains_phrase(
-    normalized_text: str,
-    pattern: re.Pattern[str],
+def _get_or_compile_pattern(
     normalized_phrase: str,
-) -> bool:
-    """Return True if ``normalized_phrase`` matches exactly or on token boundaries."""
-    if not normalized_text or not normalized_phrase:
-        return False
-    if normalized_text == normalized_phrase:
-        return True
-    return pattern.search(normalized_text) is not None
+    pattern_cache: dict[str, re.Pattern[str]],
+) -> re.Pattern[str]:
+    pattern = pattern_cache.get(normalized_phrase)
+    if pattern is None:
+        pattern = compile_phrase_pattern(normalized_phrase)
+        pattern_cache[normalized_phrase] = pattern
+    return pattern
 
 
 def _prepare_candidate(candidate: CandidateForAllocation) -> _PreparedCandidate:
     meta = candidate.metadata
-    cv = candidate.parsed_cv
 
-    major_norm = _normalize_text(meta.major)
-    field_norm = _normalize_text(meta.field)
+    major_norm = normalize_text(meta.major)
+    field_norm = normalize_text(meta.field)
     if major_norm:
-        effective_major_display = _WHITESPACE_RE.sub(" ", meta.major).strip()
+        effective_major_display = _collapse_whitespace(meta.major)
         effective_major_norm = major_norm
     elif field_norm:
-        effective_major_display = _WHITESPACE_RE.sub(" ", meta.field).strip()
+        effective_major_display = _collapse_whitespace(meta.field)
         effective_major_norm = field_norm
     else:
         effective_major_display = ""
         effective_major_norm = ""
 
-    raw_corpus_fields: list[str] = [
-        *meta.technical_skills,
-        meta.program,
-        meta.field,
-        meta.major,
-        meta.additional_info,
-        *cv.skills,
-        cv.experience_summary,
-        cv.education_summary,
-        cv.projects_summary,
-        *cv.certifications,
-        *cv.languages,
-    ]
-    corpus_chunks_norm = tuple(
-        norm for _, norm in _dedupe_normalized_items(raw_corpus_fields)
-    )
-
     return _PreparedCandidate(
-        city_norm=_normalize_text(meta.city),
+        city_norm=normalize_text(meta.city),
         gpa=meta.gpa,
         year_of_study=meta.year_of_study,
         full_time_commitment=meta.full_time_commitment is True,
         effective_major_display=effective_major_display,
         effective_major_norm=effective_major_norm,
-        corpus_chunks_norm=corpus_chunks_norm,
+        corpus_chunks_norm=build_candidate_corpus_segments(candidate),
     )
 
 
-def _prepare_position(position: PositionForAllocation) -> _PreparedPosition:
+def _prepare_position(
+    position: PositionForAllocation,
+    pattern_cache: dict[str, re.Pattern[str]],
+) -> _PreparedPosition:
     rules = position.constraints
-    city_items = _dedupe_normalized_items(rules.allowed_cities)
-    major_items = _dedupe_normalized_items(rules.required_majors)
-    keyword_items = _dedupe_normalized_items(rules.must_have_keywords)
+    city_items = dedupe_normalized_items(rules.allowed_cities)
+    major_items = dedupe_normalized_items(rules.required_majors)
+    keyword_items = dedupe_normalized_items(rules.must_have_keywords)
 
     return _PreparedPosition(
         allowed_cities_display=tuple(display for display, _ in city_items),
@@ -203,10 +148,11 @@ def _prepare_position(position: PositionForAllocation) -> _PreparedPosition:
         requires_full_time_commitment=rules.requires_full_time_commitment,
         required_majors_display=tuple(display for display, _ in major_items),
         required_major_matchers=tuple(
-            (norm, _compile_phrase_pattern(norm)) for _, norm in major_items
+            (norm, _get_or_compile_pattern(norm, pattern_cache))
+            for _, norm in major_items
         ),
         must_have_keywords=tuple(
-            (display, norm, _compile_phrase_pattern(norm))
+            (display, norm, _get_or_compile_pattern(norm, pattern_cache))
             for display, norm in keyword_items
         ),
     )
@@ -226,7 +172,7 @@ def _check_allowed_cities(
             message=f"Candidate city is missing; allowed cities: {allowed}.",
         )
     if cand.city_norm not in pos.allowed_cities_norm:
-        city_label = _WHITESPACE_RE.sub(" ", (raw_city or "")).strip()
+        city_label = _collapse_whitespace(raw_city)
         return DisqualificationReason(
             rule="allowed_cities",
             message=f"Candidate city '{city_label}' is not in allowed cities: {allowed}.",
@@ -305,7 +251,7 @@ def _check_required_majors(
             message=f"Candidate major/field is missing; required majors: {allowed}.",
         )
     if any(
-        _contains_phrase(cand.effective_major_norm, pattern, req_norm)
+        contains_phrase(cand.effective_major_norm, pattern, req_norm)
         for req_norm, pattern in pos.required_major_matchers
     ):
         return None
@@ -318,19 +264,37 @@ def _check_required_majors(
     )
 
 
+def _candidate_has_keyword(
+    cand_idx: int,
+    cand: _PreparedCandidate,
+    norm: str,
+    pattern: re.Pattern[str],
+    keyword_cache: dict[tuple[int, str], bool],
+) -> bool:
+    cache_key = (cand_idx, norm)
+    cached = keyword_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    matched = any(
+        contains_phrase(chunk, pattern, norm)
+        for chunk in cand.corpus_chunks_norm
+    )
+    keyword_cache[cache_key] = matched
+    return matched
+
+
 def _check_must_have_keywords(
+    cand_idx: int,
     cand: _PreparedCandidate,
     pos: _PreparedPosition,
+    keyword_cache: dict[tuple[int, str], bool],
 ) -> DisqualificationReason | None:
     if not pos.must_have_keywords:
         return None
     missing = [
         display
         for display, norm, pattern in pos.must_have_keywords
-        if not any(
-            _contains_phrase(chunk, pattern, norm)
-            for chunk in cand.corpus_chunks_norm
-        )
+        if not _candidate_has_keyword(cand_idx, cand, norm, pattern, keyword_cache)
     ]
     if not missing:
         return None
@@ -341,9 +305,11 @@ def _check_must_have_keywords(
 
 
 def _evaluate_pair(
+    cand_idx: int,
     raw_candidate: CandidateForAllocation,
     cand: _PreparedCandidate,
     pos: _PreparedPosition,
+    keyword_cache: dict[tuple[int, str], bool],
 ) -> list[DisqualificationReason]:
     checks = (
         _check_allowed_cities(cand, pos, raw_candidate.metadata.city),
@@ -351,7 +317,7 @@ def _evaluate_pair(
         _check_min_year_of_study(cand, pos),
         _check_full_time_commitment(cand, pos),
         _check_required_majors(cand, pos),
-        _check_must_have_keywords(cand, pos),
+        _check_must_have_keywords(cand_idx, cand, pos, keyword_cache),
     )
     return [reason for reason in checks if reason is not None]
 
@@ -379,20 +345,28 @@ def evaluate_eligibility(
     candidate_ids = _validate_unique_ids(candidates, "candidate_id")
     position_ids = _validate_unique_ids(positions, "position_id")
 
+    pattern_cache: dict[str, re.Pattern[str]] = {}
     prepared_candidates = [_prepare_candidate(cand) for cand in candidates]
-    prepared_positions = [_prepare_position(pos) for pos in positions]
+    prepared_positions = [_prepare_position(pos, pattern_cache) for pos in positions]
 
     eligibility_matrix = np.ones(
         (len(candidates), len(positions)),
         dtype=bool,
     )
     disqualifications: dict[tuple[int, int], list[DisqualificationReason]] = {}
+    keyword_cache: dict[tuple[int, str], bool] = {}
 
     for cand_idx, (raw_cand, prep_cand) in enumerate(
         zip(candidates, prepared_candidates, strict=True)
     ):
         for pos_idx, prep_pos in enumerate(prepared_positions):
-            reasons = _evaluate_pair(raw_cand, prep_cand, prep_pos)
+            reasons = _evaluate_pair(
+                cand_idx,
+                raw_cand,
+                prep_cand,
+                prep_pos,
+                keyword_cache,
+            )
             if reasons:
                 eligibility_matrix[cand_idx, pos_idx] = False
                 disqualifications[(cand_idx, pos_idx)] = reasons

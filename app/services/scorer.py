@@ -1,8 +1,9 @@
 """Vectorized hybrid scoring matrix and sparse graph pruning (Phase 5 Stages 2-3).
 
 Computes per-facet semantic cosine similarities via BLAS matrix multiplication
-combined with boundary-aware exact lexical skill coverage, then prunes the
-dense bipartite score matrix into a deterministic sparse graph for CP-SAT.
+combined with boundary-aware exact lexical skill coverage and per-position
+active-weight renormalization, then prunes the dense bipartite score matrix
+into a deterministic sparse graph (preserving locked overrides) for CP-SAT.
 """
 
 from __future__ import annotations
@@ -10,20 +11,25 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
-import re
 from typing import TypeVar
-import unicodedata
 
 import numpy as np
 
 from app.schemas.allocation import (
     AlternativePlacement,
+    LockedOverride,
     ScoreBreakdown,
     ScoringWeights,
 )
 from app.schemas.candidate import CandidateForAllocation
 from app.schemas.position import PositionForAllocation
-from app.services.extractor import _normalize_arabic
+from app.services.text_matching import (
+    build_candidate_corpus_segments,
+    compile_phrase_pattern,
+    contains_phrase,
+    dedupe_normalized_items,
+    validate_index,
+)
 
 SCORE_SCALE_FACTOR = 10_000
 _FACETS = ("skills", "academic", "practical")
@@ -45,8 +51,8 @@ class ScoringResult:
 
     def breakdown(self, i: int | np.integer, j: int | np.integer) -> ScoreBreakdown:
         """Return the sub-score breakdown for candidate ``i`` and position ``j``."""
-        cand_idx = _validate_index(i, len(self.candidate_ids), "candidate")
-        pos_idx = _validate_index(j, len(self.position_ids), "position")
+        cand_idx = validate_index(i, len(self.candidate_ids), "candidate")
+        pos_idx = validate_index(j, len(self.position_ids), "position")
         return ScoreBreakdown(
             skills_semantic=float(self.skills_semantic[cand_idx, pos_idx]),
             academic_semantic=float(self.academic_semantic[cand_idx, pos_idx]),
@@ -68,16 +74,20 @@ class ScoringResult:
         limit: int = 2,
     ) -> list[AlternativePlacement]:
         """Return up to ``limit`` highest-scoring eligible positions for candidate ``i``."""
-        cand_idx = _validate_index(i, len(self.candidate_ids), "candidate")
+        cand_idx = validate_index(i, len(self.candidate_ids), "candidate")
         eligible = _validate_eligibility_matrix(
             eligibility_matrix, self.total_scores.shape
         )
         excluded_idx: int | None = None
         if exclude_position_idx is not None:
-            excluded_idx = _validate_index(
+            excluded_idx = validate_index(
                 exclude_position_idx, len(self.position_ids), "position"
             )
-        if isinstance(limit, (bool, np.bool_)) or not isinstance(limit, (int, np.integer)) or int(limit) < 0:
+        if (
+            isinstance(limit, (bool, np.bool_))
+            or not isinstance(limit, (int, np.integer))
+            or int(limit) < 0
+        ):
             raise ValueError(f"limit must be a non-negative integer (got {limit!r}).")
         resolved_limit = int(limit)
         if resolved_limit == 0:
@@ -114,6 +124,7 @@ class SparseEdge:
     score: float
     scaled_weight: int
     breakdown: ScoreBreakdown
+    is_locked: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,15 +138,6 @@ class PrunedGraph:
 
 
 # ── Validation & vector helpers ────────────────────────────────────────────
-
-
-def _validate_index(index: int | np.integer, size: int, label: str) -> int:
-    if isinstance(index, (bool, np.bool_)) or not isinstance(index, (int, np.integer)):
-        raise IndexError(f"{label} index must be an integer (got {index!r}).")
-    idx = int(index)
-    if idx < 0 or idx >= size:
-        raise IndexError(f"{label} index {idx} out of bounds for size {size}.")
-    return idx
 
 
 def _validate_unique_ids(
@@ -224,50 +226,6 @@ def _validate_eligibility_matrix(
 # ── Boundary-aware lexical skill helpers ───────────────────────────────────
 
 
-def _normalize_skill_text(text: str) -> str:
-    normalized = unicodedata.normalize("NFC", text or "")
-    normalized = _normalize_arabic(normalized)
-    return re.sub(r"\s+", " ", normalized).strip().casefold()
-
-
-def _dedupe_normalized_skills(skills: Sequence[str]) -> tuple[str, ...]:
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for raw in skills:
-        token = _normalize_skill_text(raw)
-        if token and token not in seen:
-            seen.add(token)
-            deduped.append(token)
-    return tuple(deduped)
-
-
-def _compile_skill_pattern(normalized_skill: str) -> re.Pattern[str]:
-    """Compile a boundary-aware regex for tech symbols (C++, C#, .NET, Node.js) and Arabic."""
-    # Left boundary forbids word/symbol continuations and compound joins like Objective-C or R&D.
-    # Right boundary forbids word/symbol continuations and '.word'/'&word'/'-word' joins like Node.js or React-Native.
-    escaped = re.escape(normalized_skill)
-    return re.compile(rf"(?<![\w+#.])(?<![\w+#][&-]){escaped}(?![\w+#]|[.&-][\w+#])")
-
-
-def _build_candidate_lexical_corpus(candidate: CandidateForAllocation) -> str:
-    """Assemble candidate skills & practical text into newline-separated segments."""
-    raw_segments = [
-        *candidate.metadata.technical_skills,
-        *candidate.parsed_cv.skills,
-        candidate.parsed_cv.experience_summary,
-        candidate.parsed_cv.projects_summary,
-        *candidate.parsed_cv.certifications,
-        candidate.metadata.additional_info,
-    ]
-    # Join distinct fields/list entries with '\n' so multi-word skills cannot match across boundaries.
-    segments = [
-        normalized
-        for raw in raw_segments
-        if (normalized := _normalize_skill_text(raw))
-    ]
-    return "\n".join(segments)
-
-
 def _compute_coverage_matrix(
     n_candidates: int,
     skill_lists: Sequence[tuple[str, ...]],
@@ -287,17 +245,31 @@ def _compute_coverage_matrix(
 def _compute_lexical_matrices(
     candidates: Sequence[CandidateForAllocation],
     positions: Sequence[PositionForAllocation],
-) -> tuple[np.ndarray, np.ndarray]:
-    corpora = [_build_candidate_lexical_corpus(c) for c in candidates]
-    req_lists = [_dedupe_normalized_skills(p.required_skills) for p in positions]
-    pref_lists = [_dedupe_normalized_skills(p.preferred_skills) for p in positions]
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    list[tuple[str, ...]],
+    list[tuple[str, ...]],
+]:
+    corpora = [build_candidate_corpus_segments(c) for c in candidates]
+    req_lists = [
+        tuple(norm for _, norm in dedupe_normalized_items(p.required_skills))
+        for p in positions
+    ]
+    pref_lists = [
+        tuple(norm for _, norm in dedupe_normalized_items(p.preferred_skills))
+        for p in positions
+    ]
 
     unique_skills = {skill for group in (*req_lists, *pref_lists) for skill in group}
     skill_matches: dict[str, np.ndarray] = {}
     for skill in unique_skills:
-        pattern = _compile_skill_pattern(skill)
+        pattern = compile_phrase_pattern(skill)
         skill_matches[skill] = np.fromiter(
-            (bool(pattern.search(corpus)) for corpus in corpora),
+            (
+                any(contains_phrase(segment, pattern, skill) for segment in segments)
+                for segments in corpora
+            ),
             dtype=np.float64,
             count=len(corpora),
         )
@@ -306,6 +278,8 @@ def _compute_lexical_matrices(
     return (
         _compute_coverage_matrix(n_candidates, req_lists, skill_matches),
         _compute_coverage_matrix(n_candidates, pref_lists, skill_matches),
+        req_lists,
+        pref_lists,
     )
 
 
@@ -335,6 +309,7 @@ def score_pairs(
     )
 
     semantic_matrices: dict[str, np.ndarray] = {}
+    pos_active_facets: dict[str, np.ndarray] = {}
     for facet in _FACETS:
         cand_matrix, dim = _stack_and_normalize_vectors(
             [getattr(c.vectors, facet) for c in candidates],
@@ -349,9 +324,12 @@ def score_pairs(
             entity_ids=position_ids,
             expected_dim=dim,
         )
+        pos_active_facets[facet] = np.any(pos_matrix != 0.0, axis=1)
         semantic_matrices[facet] = np.clip(cand_matrix @ pos_matrix.T, 0.0, 1.0)
 
-    req_lexical, pref_lexical = _compute_lexical_matrices(candidates, positions)
+    req_lexical, pref_lexical, req_lists, pref_lists = _compute_lexical_matrices(
+        candidates, positions
+    )
 
     skills_sim = semantic_matrices["skills"]
     academic_sim = semantic_matrices["academic"]
@@ -364,7 +342,34 @@ def score_pairs(
         + resolved_weights.required_skills_lexical * req_lexical
         + resolved_weights.preferred_skills_lexical * pref_lexical
     )
-    total_scores = np.clip(blended, 0.0, 1.0)
+
+    req_active = np.fromiter(
+        (len(skills) > 0 for skills in req_lists),
+        dtype=bool,
+        count=len(positions),
+    )
+    pref_active = np.fromiter(
+        (len(skills) > 0 for skills in pref_lists),
+        dtype=bool,
+        count=len(positions),
+    )
+
+    # Renormalize per position column across active position-side components only,
+    # keeping sub-score matrices raw while preventing empty position fields from
+    # capping candidate scores below 1.0 (never renormalizing for empty candidate fields).
+    active_weight_sums = (
+        resolved_weights.skills_semantic
+        * pos_active_facets["skills"].astype(np.float64)
+        + resolved_weights.academic_semantic
+        * pos_active_facets["academic"].astype(np.float64)
+        + resolved_weights.practical_semantic
+        * pos_active_facets["practical"].astype(np.float64)
+        + resolved_weights.required_skills_lexical * req_active.astype(np.float64)
+        + resolved_weights.preferred_skills_lexical * pref_active.astype(np.float64)
+    )
+    safe_denom = np.where(active_weight_sums > 0.0, active_weight_sums, 1.0)
+    renormalized = np.where(active_weight_sums > 0.0, blended / safe_denom, 0.0)
+    total_scores = np.clip(renormalized, 0.0, 1.0)
 
     return ScoringResult(
         total_scores=total_scores,
@@ -414,14 +419,64 @@ def _select_top_k_indices(
     return chosen
 
 
+def _resolve_locked_overrides(
+    locked_overrides: Sequence[LockedOverride] | None,
+    candidate_ids: tuple[str, ...],
+    position_ids: tuple[str, ...],
+) -> dict[int, int]:
+    """Validate and deduplicate locked overrides into ``{cand_idx: pos_idx}``."""
+    if locked_overrides is None:
+        return {}
+    if isinstance(locked_overrides, (str, bytes)) or not isinstance(
+        locked_overrides, Sequence
+    ):
+        raise ValueError(
+            "locked_overrides must be a sequence of LockedOverride or None."
+        )
+    if not locked_overrides:
+        return {}
+
+    cand_idx_by_id = {cid: idx for idx, cid in enumerate(candidate_ids)}
+    pos_idx_by_id = {pid: idx for idx, pid in enumerate(position_ids)}
+    locked_by_cand: dict[int, int] = {}
+
+    for override in locked_overrides:
+        if not isinstance(override, LockedOverride):
+            raise ValueError(
+                "locked_overrides entries must be LockedOverride instances "
+                f"(got {type(override).__name__})."
+            )
+        if override.candidate_id not in cand_idx_by_id:
+            raise ValueError(
+                f"Unknown candidate_id in locked_overrides: {override.candidate_id!r}."
+            )
+        if override.position_id not in pos_idx_by_id:
+            raise ValueError(
+                f"Unknown position_id in locked_overrides: {override.position_id!r}."
+            )
+        cand_idx = cand_idx_by_id[override.candidate_id]
+        pos_idx = pos_idx_by_id[override.position_id]
+        existing_pos_idx = locked_by_cand.get(cand_idx)
+        if existing_pos_idx is not None and existing_pos_idx != pos_idx:
+            raise ValueError(
+                f"Conflicting locked_overrides for candidate_id "
+                f"{override.candidate_id!r}: {position_ids[existing_pos_idx]!r} "
+                f"vs {override.position_id!r}."
+            )
+        locked_by_cand[cand_idx] = pos_idx
+
+    return locked_by_cand
+
+
 def prune_sparse_graph(
     scoring: ScoringResult,
     eligibility_matrix: np.ndarray,
     *,
     min_match_threshold: float = 0.45,
     top_k_per_candidate: int = 12,
+    locked_overrides: Sequence[LockedOverride] | None = None,
 ) -> PrunedGraph:
-    """Prune ineligible/below-threshold pairs and retain top-K edges per candidate."""
+    """Prune ineligible/below-threshold pairs and retain top-K edges plus locks."""
     eligible = _validate_eligibility_matrix(
         eligibility_matrix, scoring.total_scores.shape
     )
@@ -443,6 +498,10 @@ def prune_sparse_graph(
             f"top_k_per_candidate must be an integer >= 1 (got {top_k_per_candidate!r})."
         )
 
+    locked_by_cand = _resolve_locked_overrides(
+        locked_overrides, scoring.candidate_ids, scoring.position_ids
+    )
+
     threshold = float(min_match_threshold)
     surviving_mask = eligible & (scoring.total_scores >= threshold)
 
@@ -461,6 +520,16 @@ def prune_sparse_graph(
             surviving_indices,
             top_k_per_candidate,
         )
+        locked_pos_idx = locked_by_cand.get(cand_idx)
+        if locked_pos_idx is not None and locked_pos_idx not in selected_positions:
+            selected_positions.append(locked_pos_idx)
+            selected_positions.sort(
+                key=lambda pos_idx: (
+                    -float(scoring.total_scores[cand_idx, pos_idx]),
+                    pos_idx,
+                )
+            )
+
         candidate_edges: list[SparseEdge] = []
         for pos_idx in selected_positions:
             score = float(scoring.total_scores[cand_idx, pos_idx])
@@ -472,6 +541,7 @@ def prune_sparse_graph(
                 score=score,
                 scaled_weight=int(round(score * SCORE_SCALE_FACTOR)),
                 breakdown=scoring.breakdown(cand_idx, pos_idx),
+                is_locked=(pos_idx == locked_pos_idx),
             )
             candidate_edges.append(edge)
         edges_by_candidate[cand_idx] = candidate_edges
