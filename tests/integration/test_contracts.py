@@ -2,7 +2,7 @@ import hashlib
 import io
 import json
 
-import fitz
+import pymupdf
 import pytest
 from docx import Document
 from fastapi.testclient import TestClient
@@ -11,14 +11,59 @@ from app.api.v1 import candidates as candidate_routes
 from app.core.config import settings
 from app.main import app
 from app.schemas.candidate import ParsedCV
+from app.schemas.position import FacetedVectors
 from app.services.parser import CVParsingError
 
 AUTH_HEADERS = {"X-API-Key": settings.INTERNAL_API_KEY}
 
 
+class _FakeEmbeddingService:
+    """Deterministic embedding service for integration tests."""
+
+    _DIM = 4
+
+    @property
+    def model_version(self) -> str:
+        return "fake-test-model"
+
+    @property
+    def dimension(self) -> int:
+        return self._DIM
+
+    def _vectors(self) -> FacetedVectors:
+        return FacetedVectors(
+            skills=[0.5] * self._DIM,
+            academic=[0.5] * self._DIM,
+            practical=[0.5] * self._DIM,
+        )
+
+    def embed_position(self, request):
+        return self._vectors()
+
+    def embed_candidate(self, metadata, parsed_cv):
+        return self._vectors()
+
+
 @pytest.fixture
-def client():
+def client(monkeypatch):
+    # Prevent integration tests from making live LLM requests when local .env
+    # defines EXTRACTION_LLM_* settings.
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_BASE_URL", None)
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_MODEL", None)
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_API_KEY", None)
+
+    # Prevent slow model download attempts during lifespan.
+    from app.services import embedder as _embedder_mod
+
+    def _skip_load(model_name):
+        raise RuntimeError("Skipped in test environment")
+
+    monkeypatch.setattr(_embedder_mod.EmbeddingService, "load", _skip_load)
+
     with TestClient(app) as test_client:
+        # Inject deterministic fake embedder for integration tests.
+        app.state.embedding_service = _FakeEmbeddingService()
+        app.state.models_loaded = True
         yield test_client
 
 
@@ -43,21 +88,27 @@ def make_docx(*, text: str | None = None) -> bytes:
 
 
 def make_pdf_cv() -> bytes:
-    document = fitz.open()
+    document = pymupdf.open()
     page = document.new_page()
-    lines = [
-        "Skills",
-        "Python, FastAPI, Socket.io, ML.NET",
-        "Experience",
-        "Built backend APIs and maintained automated deployment pipelines across production services.",
-        "Contact: 0944 123456 | person@example.com | 12345678901",
-        "Education",
-        "BSc Computer Science, 2020-2024",
+    sections = [
+        ("Skills", ["Python, FastAPI, Socket.io, ML.NET"]),
+        (
+            "Experience",
+            [
+                "Built backend APIs and maintained automated deployment pipelines across production services.",
+                "Contact: 0944 123456 | person@example.com | 12345678901",
+            ],
+        ),
+        ("Education", ["BSc Computer Science, 2020-2024"]),
     ]
     y = 72
-    for line in lines:
-        page.insert_text((72, y), line)
-        y += 20
+    for heading, body_lines in sections:
+        page.insert_text((72, y), heading, fontsize=15, fontname="hebo")
+        y += 22
+        for line in body_lines:
+            page.insert_text((72, y), line, fontsize=11, fontname="helv")
+            y += 18
+        y += 18
     content = document.tobytes()
     document.close()
     return content
@@ -82,15 +133,21 @@ def _sample_position(position_id: str = "p1", min_seats: int = 0, max_seats: int
     }
 
 
+# ---------------------------------------------------------------------------
+# Health & readiness
+# ---------------------------------------------------------------------------
+
+
 def test_health_and_ready_probes(client):
     health_res = client.get("/health")
     assert health_res.status_code == 200
     assert "X-Request-ID" in health_res.headers
 
-    assert client.get("/ready").status_code == 503
-    app.state.models_loaded = True
+    # Fixture injects the embedding service and sets models_loaded = True.
     assert client.get("/ready").status_code == 200
     app.state.models_loaded = False
+    assert client.get("/ready").status_code == 503
+    app.state.models_loaded = True
 
 
 def test_protected_routes_reject_missing_or_wrong_api_key(client):
@@ -104,20 +161,55 @@ def test_protected_routes_reject_missing_or_wrong_api_key(client):
     assert res_wrong.status_code == 401
 
 
-def test_position_embed_contract_validation_remains_phase_4_stub(client):
+# ---------------------------------------------------------------------------
+# Position embedding (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_position_embed_returns_faceted_vectors(client):
     bad = client.post("/api/v1/positions/embed", json={}, headers=AUTH_HEADERS)
     assert bad.status_code == 422
 
-    good = client.post(
+    res = client.post(
         "/api/v1/positions/embed",
         json={
             "position_id": "pos-1",
             "title": "Backend Intern",
             "required_skills": ["PHP", "Laravel", "MySQL"],
+            "target_majors": ["Computer Science"],
+            "academic_level": "Bachelor",
+            "responsibilities": "Build and maintain backend APIs",
+            "experience_level": "Junior",
         },
         headers=AUTH_HEADERS,
     )
-    assert good.status_code == 501
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["position_id"] == "pos-1"
+    assert payload["model_version"] == "fake-test-model"
+    vectors = payload["vectors"]
+    assert len(vectors["skills"]) == _FakeEmbeddingService._DIM
+    assert len(vectors["academic"]) == _FakeEmbeddingService._DIM
+    assert len(vectors["practical"]) == _FakeEmbeddingService._DIM
+
+
+def test_position_embed_returns_503_without_embedding_service(client):
+    saved = app.state.embedding_service
+    app.state.embedding_service = None
+    try:
+        res = client.post(
+            "/api/v1/positions/embed",
+            json={"position_id": "pos-1", "title": "Intern"},
+            headers=AUTH_HEADERS,
+        )
+        assert res.status_code == 503
+    finally:
+        app.state.embedding_service = saved
+
+
+# ---------------------------------------------------------------------------
+# Candidate ingestion (Phase 3 parsing + Phase 4 embeddings)
+# ---------------------------------------------------------------------------
 
 
 def test_candidate_ingest_multipart_contract(client):
@@ -144,8 +236,11 @@ def test_candidate_ingest_multipart_contract(client):
     assert payload["extraction_status"] == "completed"
     assert payload["extraction_method"] == "fallback_heuristic"
     assert payload["parsed_cv"]["skills"] == ["Python", "FastAPI", "PostgreSQL"]
-    assert payload["vectors"] is None  # Faceted embeddings are Phase 4.
-    assert payload["model_version"] == "not_generated_phase_4"
+    assert payload["vectors"] is not None
+    assert len(payload["vectors"]["skills"]) == _FakeEmbeddingService._DIM
+    assert len(payload["vectors"]["academic"]) == _FakeEmbeddingService._DIM
+    assert len(payload["vectors"]["practical"]) == _FakeEmbeddingService._DIM
+    assert payload["model_version"] == "fake-test-model"
 
 
 def test_candidate_ingest_real_pdf_end_to_end(client):
@@ -166,6 +261,8 @@ def test_candidate_ingest_real_pdf_end_to_end(client):
     assert "ML.NET" in payload["parsed_cv"]["skills"]
     assert "0944 123456" not in payload["parsed_cv"]["experience_summary"]
     assert "2020-2024" in payload["parsed_cv"]["education_summary"]
+    assert payload["vectors"] is not None
+    assert payload["model_version"] == "fake-test-model"
 
 
 def test_candidate_ingest_arabic_docx_end_to_end(client):
@@ -195,6 +292,8 @@ def test_candidate_ingest_arabic_docx_end_to_end(client):
     assert payload["parsed_cv"]["skills"] == ["بايثون", "فاست أي بي آي", "دوكر"]
     assert "جامعة دمشق" in payload["parsed_cv"]["education_summary"]
     assert payload["parsed_cv"]["cv_completeness_score"] > 0.0
+    assert payload["vectors"] is not None
+    assert payload["model_version"] == "fake-test-model"
 
 
 def test_candidate_pii_is_scrubbed_before_provider_call(client, monkeypatch):
@@ -255,6 +354,7 @@ def test_candidate_ingest_short_document_returns_needs_ocr(client):
     assert payload["extraction_status"] == "needs_ocr"
     assert payload["extraction_method"] == "none"
     assert payload["parsed_cv"] is None
+    assert payload["vectors"] is None
     assert "OCR" in payload["extraction_error"]
 
 
@@ -277,6 +377,7 @@ def test_candidate_ingest_surfaces_document_conversion_failure(client, monkeypat
     assert payload["extraction_status"] == "failed"
     assert payload["extraction_method"] == "none"
     assert payload["cv_hash"] == "a" * 64
+    assert payload["vectors"] is None
     assert "could not be converted" in payload["extraction_error"]
 
 
@@ -310,6 +411,11 @@ def test_candidate_ingest_rejects_malformed_json_metadata(client):
         data={"metadata": "{not-valid-json"},
     )
     assert res.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Allocation stubs (Phase 5–6)
+# ---------------------------------------------------------------------------
 
 
 def test_allocation_solve_valid_payload_returns_501(client):

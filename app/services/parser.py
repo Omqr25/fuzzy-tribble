@@ -136,9 +136,9 @@ def validate_and_hash_cv(
 
 def _reject_encrypted_pdf(content: bytes) -> None:
     try:
-        import fitz
+        import pymupdf
 
-        with fitz.open(stream=content, filetype="pdf") as document:
+        with pymupdf.open(stream=content, filetype="pdf") as document:
             if document.is_encrypted or document.needs_pass:
                 raise CVValidationError(
                     "Password-protected or encrypted PDF files are not accepted.",
@@ -270,14 +270,14 @@ def _pdf_to_markdown(content: bytes) -> str:
     """Use PyMuPDF4LLM's layout-aware Markdown conversion."""
 
     try:
-        import fitz
+        import pymupdf
         import pymupdf4llm
     except ImportError as exc:
         raise RuntimeError(
             "PDF conversion dependencies are unavailable; install pymupdf4llm."
         ) from exc
 
-    with fitz.open(stream=content, filetype="pdf") as document:
+    with pymupdf.open(stream=content, filetype="pdf") as document:
         if document.is_encrypted or document.needs_pass:
             # Recheck at conversion time in case this function is called alone.
             raise CVValidationError(

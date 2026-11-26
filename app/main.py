@@ -12,7 +12,23 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.models_loaded = False
+    try:
+        from app.services.embedder import EmbeddingService
+
+        service = EmbeddingService.load(settings.EMBEDDING_MODEL)
+        app.state.embedding_service = service
+        app.state.models_loaded = True
+        logger.info(
+            "Embedding model loaded: %s (dim=%d)",
+            service.model_version,
+            service.dimension,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to load embedding model '%s'", settings.EMBEDDING_MODEL
+        )
+        app.state.embedding_service = None
+        app.state.models_loaded = False
     yield
 
 

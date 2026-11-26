@@ -24,9 +24,6 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)],
 )
 
-#####################################################
-NO_EMBEDDING_MODEL_VERSION = "not_generated_phase_4"#
-#####################################################
 
 @router.post("/ingest", response_model=CandidateIngestResponse)
 async def ingest_candidate(
@@ -41,6 +38,11 @@ async def ingest_candidate(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=exc.errors(),
         ) from exc
+
+    embedding_service = getattr(request.app.state, "embedding_service", None)
+    model_version = (
+        embedding_service.model_version if embedding_service else "unavailable"
+    )
 
     try:
         content = await cv_file.read(settings.CV_MAX_FILE_SIZE_BYTES + 1)
@@ -67,7 +69,7 @@ async def ingest_candidate(
             extraction_error=str(exc),
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
 
     scrubbed_markdown = scrub_pii(parsed_document.markdown)
@@ -84,7 +86,7 @@ async def ingest_candidate(
             ),
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
 
     provider = getattr(request.app.state, "cv_extraction_provider", None)
@@ -108,8 +110,23 @@ async def ingest_candidate(
             extraction_error="Structured extraction and deterministic fallback both failed.",
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
+
+    # Phase 4: Generate faceted embeddings for the candidate.
+    vectors = None
+    if embedding_service is not None:
+        try:
+            vectors = await run_in_threadpool(
+                embedding_service.embed_candidate,
+                parsed_metadata,
+                extraction.parsed_cv,
+            )
+        except Exception:
+            logger.exception(
+                "Candidate embedding failed for hash %s",
+                parsed_document.cv_hash,
+            )
 
     return CandidateIngestResponse(
         candidate_id=parsed_metadata.candidate_id,
@@ -118,6 +135,6 @@ async def ingest_candidate(
         extraction_method=extraction.extraction_method,
         extraction_error=extraction.extraction_error,
         parsed_cv=extraction.parsed_cv,
-        vectors=None,
-        model_version=NO_EMBEDDING_MODEL_VERSION,
+        vectors=vectors,
+        model_version=model_version,
     )

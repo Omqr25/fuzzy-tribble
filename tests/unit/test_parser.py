@@ -3,7 +3,7 @@ import io
 import sys
 import types
 
-import fitz
+import pymupdf
 import pytest
 from docx import Document
 
@@ -34,7 +34,7 @@ def make_docx(*, long_text: bool = True) -> bytes:
 
 
 def make_pdf(text: str = "An ordinary CV PDF") -> bytes:
-    document = fitz.open()
+    document = pymupdf.open()
     page = document.new_page()
     page.insert_text((72, 72), text)
     content = document.tobytes()
@@ -43,11 +43,11 @@ def make_pdf(text: str = "An ordinary CV PDF") -> bytes:
 
 
 def make_encrypted_pdf() -> bytes:
-    document = fitz.open()
+    document = pymupdf.open()
     page = document.new_page()
     page.insert_text((72, 72), "Confidential CV content")
     content = document.tobytes(
-        encryption=fitz.PDF_ENCRYPT_AES_256,
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
         owner_pw="owner-password",
         user_pw="user-password",
     )

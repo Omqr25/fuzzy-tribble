@@ -101,6 +101,17 @@ AWS Solutions Architect
     assert parsed.certifications == ["AWS Solutions Architect"]
 
 
+def test_heading_fallback_extracts_inline_headings():
+    inline_markdown = """**Skills:** Python, Socket.io, ML.NET
+Languages: Arabic, English
+المشاريع: نظام مطابقة وتوزيع المتدربين
+"""
+    parsed = extract_with_heading_fallback(inline_markdown)
+    assert parsed.skills == ["Python", "Socket.io", "ML.NET"]
+    assert parsed.languages == ["Arabic", "English"]
+    assert "نظام مطابقة" in parsed.projects_summary
+
+
 def test_heading_fallback_extracts_arabic_cv_sections():
     arabic_markdown = """المهارات التقنية
 بايثون، فاست أي بي آي، قواعد بيانات

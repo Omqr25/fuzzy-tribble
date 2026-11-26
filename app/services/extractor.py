@@ -278,6 +278,13 @@ _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<heading>.+?)\s*#*\s*$")
 _EMPHASIS_WRAPPED_RE = re.compile(
     r"^(?P<marker>\*{1,3}|_{1,3})(?P<inner>.+?)(?P=marker)\s*:?\s*$"
 )
+_INLINE_EMPHASIS_HEADING_RE = re.compile(
+    r"^(?P<marker>\*{1,3}|_{1,3})(?P<prefix>[^:*_]+?)"
+    r"(?::(?P=marker)|(?P=marker)\s*:)\s*(?P<remainder>.+)$"
+)
+_INLINE_PLAIN_HEADING_RE = re.compile(
+    r"^(?P<prefix>[^:]{1,60}?)\s*:\s*(?P<remainder>.+)$"
+)
 _INLINE_EMPHASIS_RE = re.compile(r"(\*{1,3}|_{1,3})(.+?)\1")
 _BULLET_LINE_RE = re.compile(r"^(?:[-*+•>]\s+|[-+•>]|\d+[.)]\s+)")
 _ARABIC_DIACRITICS_RE = re.compile(r"[\u0640\u064b-\u065f\u0670]")
@@ -355,27 +362,39 @@ def _classify_heading(heading: str) -> str | None:
 
 
 def _is_title_like(text: str) -> bool:
-    """Accept ALL CAPS and Title Case headings including lowercase connectors."""
-
-    if text.isupper() or text.istitle():
-        return True
+    """Return True if Latin text is ALL CAPS or Title Case (allowing connectors)."""
     words = text.split()
     if not words:
         return False
-    for index, word in enumerate(words):
-        if index > 0 and word.lower() in _TITLE_CONNECTORS:
+    if text.isupper():
+        return True
+    for idx, word in enumerate(words):
+        cleaned = word.strip("()[]{}\"'.,;:-")
+        if not cleaned:
             continue
-        if not (word.isupper() or word[0].isupper()):
+        if idx > 0 and cleaned.lower() in _TITLE_CONNECTORS:
+            continue
+        if _LATIN_LETTER_RE.search(cleaned) and not cleaned[0].isupper():
             return False
     return True
 
-
-def _extract_plain_heading_section(line: str) -> str | None:
-    """Identify standalone bold/italic or plain-text section headings."""
+def _extract_plain_heading_section(line: str) -> tuple[str, str | None] | None:
+    """Identify standalone or inline (``Heading: value``) section headings."""
 
     stripped = line.strip()
     if not stripped or _BULLET_LINE_RE.match(stripped):
         return None
+
+    # First check inline emphasized/plain headings such as ``**Skills:** Python``
+    # or ``Languages: Arabic, English`` before testing standalone lines.
+    inline_emphasis = _INLINE_EMPHASIS_HEADING_RE.match(stripped)
+    if inline_emphasis:
+        prefix = inline_emphasis.group("prefix").strip()
+        remainder = inline_emphasis.group("remainder").strip()
+        if prefix and len(prefix) <= 60 and len(prefix.split()) <= 7:
+            section = _classify_heading(prefix)
+            if section is not None:
+                return section, remainder or None
 
     is_emphasized = False
     emphasis_match = _EMPHASIS_WRAPPED_RE.match(stripped)
@@ -385,19 +404,26 @@ def _extract_plain_heading_section(line: str) -> str | None:
     else:
         candidate = stripped.strip(":")
 
-    if not candidate or len(candidate) > 60 or len(candidate.split()) > 7:
-        return None
+    if candidate and len(candidate) <= 60 and len(candidate.split()) <= 7:
+        section = _classify_heading(candidate)
+        if section is not None and (
+            is_emphasized
+            or not _LATIN_LETTER_RE.search(candidate)
+            or _is_title_like(candidate)
+        ):
+            return section, None
 
-    section = _classify_heading(candidate)
-    if section is None:
-        return None
+    inline_plain = _INLINE_PLAIN_HEADING_RE.match(stripped)
+    if inline_plain:
+        prefix = inline_plain.group("prefix").strip()
+        remainder = inline_plain.group("remainder").strip()
+        if prefix and len(prefix) <= 60 and len(prefix.split()) <= 7:
+            section = _classify_heading(prefix)
+            if section is not None and (
+                not _LATIN_LETTER_RE.search(prefix) or _is_title_like(prefix)
+            ):
+                return section, remainder or None
 
-    # Bold/italic standalone headings (common in pymupdf4llm output) and
-    # non-Latin scripts such as Arabic do not require English title/upper case.
-    if is_emphasized or not _LATIN_LETTER_RE.search(candidate):
-        return section
-    if _is_title_like(candidate):
-        return section
     return None
 
 
@@ -410,9 +436,11 @@ def _split_sections(markdown: str) -> dict[str, list[str]]:
         if heading_match:
             active = _classify_heading(heading_match.group("heading"))
             continue
-        plain_section = _extract_plain_heading_section(line)
-        if plain_section is not None:
-            active = plain_section
+        plain_match = _extract_plain_heading_section(line)
+        if plain_match is not None:
+            active, inline_remainder = plain_match
+            if inline_remainder:
+                sections[active].append(inline_remainder)
             continue
         if active is not None:
             sections[active].append(line)
