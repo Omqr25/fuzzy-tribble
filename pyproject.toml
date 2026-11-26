@@ -1,0 +1,27 @@
+[project]
+name = "syriatel-matching-service"
+version = "0.1.0"
+description = "AI-driven candidate-to-department matching and allocation microservice"
+requires-python = ">=3.11"
+dependencies = [
+"fastapi",
+"uvicorn[standard]",
+"pydantic-settings",
+"python-multipart",
+"pymupdf4llm",
+"python-docx",
+"sentence-transformers",
+"torch",
+"numpy",
+"ortools",
+"httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+"pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
