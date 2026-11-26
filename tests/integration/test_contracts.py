@@ -2,12 +2,13 @@ import hashlib
 import io
 import json
 
+import fitz
 import pytest
 from docx import Document
 from fastapi.testclient import TestClient
 
-from app.core.config import settings
 from app.api.v1 import candidates as candidate_routes
+from app.core.config import settings
 from app.main import app
 from app.schemas.candidate import ParsedCV
 from app.services.parser import CVParsingError
@@ -39,6 +40,27 @@ def make_docx(*, text: str | None = None) -> bytes:
     stream = io.BytesIO()
     document.save(stream)
     return stream.getvalue()
+
+
+def make_pdf_cv() -> bytes:
+    document = fitz.open()
+    page = document.new_page()
+    lines = [
+        "Skills",
+        "Python, FastAPI, Socket.io, ML.NET",
+        "Experience",
+        "Built backend APIs and maintained automated deployment pipelines across production services.",
+        "Contact: 0944 123456 | person@example.com | 12345678901",
+        "Education",
+        "BSc Computer Science, 2020-2024",
+    ]
+    y = 72
+    for line in lines:
+        page.insert_text((72, y), line)
+        y += 20
+    content = document.tobytes()
+    document.close()
+    return content
 
 
 def _sample_candidate(candidate_id: str = "c1", meta_id: str | None = None) -> dict:
@@ -126,6 +148,53 @@ def test_candidate_ingest_multipart_contract(client):
     assert payload["model_version"] == "not_generated_phase_4"
 
 
+def test_candidate_ingest_real_pdf_end_to_end(client):
+    content = make_pdf_cv()
+    res = client.post(
+        "/api/v1/candidates/ingest",
+        headers=AUTH_HEADERS,
+        files={"cv_file": ("cv.pdf", content, "application/pdf")},
+        data={"metadata": json.dumps({"candidate_id": "cand-pdf"})},
+    )
+
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["extraction_status"] == "completed"
+    assert payload["extraction_method"] == "fallback_heuristic"
+    assert payload["cv_hash"] == hashlib.sha256(content).hexdigest()
+    assert "Socket.io" in payload["parsed_cv"]["skills"]
+    assert "ML.NET" in payload["parsed_cv"]["skills"]
+    assert "0944 123456" not in payload["parsed_cv"]["experience_summary"]
+    assert "2020-2024" in payload["parsed_cv"]["education_summary"]
+
+
+def test_candidate_ingest_arabic_docx_end_to_end(client):
+    document = Document()
+    document.add_paragraph("المهارات التقنية")
+    document.add_paragraph("بايثون، فاست أي بي آي، دوكر")
+    document.add_paragraph("الخبرة العملية")
+    document.add_paragraph(
+        "تطوير واجهات برمجية خلفية واختبار الأنظمة الموزعة والعمل مع فرق هندسية لبناء خدمات مستقرة."
+    )
+    document.add_paragraph("التعليم")
+    document.add_paragraph("بكالوريوس هندسة معلوماتية من جامعة دمشق")
+    stream = io.BytesIO()
+    document.save(stream)
+
+    res = client.post(
+        "/api/v1/candidates/ingest",
+        headers=AUTH_HEADERS,
+        files={"cv_file": ("arabic_cv.docx", stream.getvalue(), "application/octet-stream")},
+        data={"metadata": json.dumps({"candidate_id": "cand-ar"})},
+    )
+
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["extraction_status"] == "completed"
+    assert payload["extraction_method"] == "fallback_heuristic"
+    assert payload["parsed_cv"]["skills"] == ["بايثون", "فاست أي بي آي", "دوكر"]
+    assert "جامعة دمشق" in payload["parsed_cv"]["education_summary"]
+    assert payload["parsed_cv"]["cv_completeness_score"] > 0.0
 
 
 def test_candidate_pii_is_scrubbed_before_provider_call(client, monkeypatch):
@@ -140,9 +209,9 @@ def test_candidate_pii_is_scrubbed_before_provider_call(client, monkeypatch):
     monkeypatch.setattr(app.state, "cv_extraction_provider", provider, raising=False)
     content = make_docx(
         text=(
-            "Experienced developer with Python and API skills. Contact: "
+            "Experienced developer with Python, Socket.io, and API skills. Contact: "
             "private.person@example.com, https://portfolio.example.com/me, "
-            "+963 944 123 456, national id 12345678901. "
+            "+963 944 123 456, 0944 123456, national id 12345678901. "
             "Built services, wrote automated tests, and supported deployments."
         )
     )
@@ -156,20 +225,29 @@ def test_candidate_pii_is_scrubbed_before_provider_call(client, monkeypatch):
     assert res.status_code == 200, res.text
     assert res.json()["extraction_method"] == "llm"
     assert provider.received_markdown is not None
+    assert "Socket.io" in provider.received_markdown
     for secret in (
         "private.person@example.com",
         "https://portfolio.example.com/me",
         "+963 944 123 456",
+        "0944 123456",
         "12345678901",
     ):
         assert secret not in provider.received_markdown
+
 
 def test_candidate_ingest_short_document_returns_needs_ocr(client):
     content = make_docx(text="Too short")
     res = client.post(
         "/api/v1/candidates/ingest",
         headers=AUTH_HEADERS,
-        files={"cv_file": ("cv.docx", content, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+        files={
+            "cv_file": (
+                "cv.docx",
+                content,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
         data={"metadata": json.dumps({"candidate_id": "cand-short"})},
     )
     assert res.status_code == 200, res.text
@@ -178,8 +256,6 @@ def test_candidate_ingest_short_document_returns_needs_ocr(client):
     assert payload["extraction_method"] == "none"
     assert payload["parsed_cv"] is None
     assert "OCR" in payload["extraction_error"]
-
-
 
 
 def test_candidate_ingest_surfaces_document_conversion_failure(client, monkeypatch):
@@ -202,6 +278,7 @@ def test_candidate_ingest_surfaces_document_conversion_failure(client, monkeypat
     assert payload["extraction_method"] == "none"
     assert payload["cv_hash"] == "a" * 64
     assert "could not be converted" in payload["extraction_error"]
+
 
 def test_candidate_ingest_rejects_mime_extension_mismatch(client):
     content = make_docx()
@@ -262,13 +339,21 @@ def test_allocation_schema_invariants(client):
         "candidates": [_sample_candidate()],
         "positions": [_sample_position(min_seats=5, max_seats=2)],
     }
-    assert client.post("/api/v1/allocations/solve", json=bad_seats, headers=AUTH_HEADERS).status_code == 422
+    assert (
+        client.post("/api/v1/allocations/solve", json=bad_seats, headers=AUTH_HEADERS).status_code
+        == 422
+    )
 
     mismatched_id = {
         "candidates": [_sample_candidate(candidate_id="c1", meta_id="c2")],
         "positions": [_sample_position()],
     }
-    assert client.post("/api/v1/allocations/solve", json=mismatched_id, headers=AUTH_HEADERS).status_code == 422
+    assert (
+        client.post(
+            "/api/v1/allocations/solve", json=mismatched_id, headers=AUTH_HEADERS
+        ).status_code
+        == 422
+    )
 
 
 def test_allocation_explain_contract(client):

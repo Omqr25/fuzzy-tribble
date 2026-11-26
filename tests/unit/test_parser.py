@@ -33,10 +33,10 @@ def make_docx(*, long_text: bool = True) -> bytes:
     return stream.getvalue()
 
 
-def make_pdf() -> bytes:
+def make_pdf(text: str = "An ordinary CV PDF") -> bytes:
     document = fitz.open()
     page = document.new_page()
-    page.insert_text((72, 72), "An ordinary CV PDF")
+    page.insert_text((72, 72), text)
     content = document.tobytes()
     document.close()
     return content
@@ -82,12 +82,53 @@ def test_pdf_conversion_uses_pymupdf4llm_without_implicit_ocr(monkeypatch):
     assert calls["use_ocr"] is False
 
 
+def test_pdf_conversion_runs_against_real_pymupdf4llm():
+    result = parse_cv(
+        make_pdf("Backend Engineer experienced with Python, FastAPI, and PostgreSQL."),
+        "candidate.pdf",
+    )
+    assert result.file_type == "pdf"
+    assert "Backend Engineer" in result.markdown
+    assert "FastAPI" in result.markdown
+
+
+def test_pdf_conversion_omits_unsupported_pymupdf4llm_kwargs(monkeypatch):
+    fake_module = types.ModuleType("pymupdf4llm")
+
+    def to_markdown(document, show_progress=True):
+        assert show_progress is False
+        return "## Skills\nPython, Docker"
+
+    fake_module.to_markdown = to_markdown
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", fake_module)
+
+    result = parse_cv(make_pdf(), "candidate.pdf")
+    assert "Python, Docker" in result.markdown
+
+
 def test_docx_conversion_preserves_headings_and_body_text():
     result = parse_cv(make_docx(), "candidate.docx")
     assert "## Skills" in result.markdown
     assert "## Experience" in result.markdown
     assert "Python, FastAPI" in result.markdown
     assert result.file_type == "docx"
+
+
+def test_docx_merged_table_cells_are_not_duplicated():
+    document = Document()
+    table = document.add_table(rows=2, cols=3)
+    merged = table.cell(0, 0).merge(table.cell(0, 2))
+    merged.text = "Merged Header Banner"
+    table.cell(1, 0).text = "Python"
+    table.cell(1, 1).text = "FastAPI"
+    table.cell(1, 2).text = "PostgreSQL"
+
+    stream = io.BytesIO()
+    document.save(stream)
+
+    result = parse_cv(stream.getvalue(), "merged.docx")
+    assert result.markdown.count("Merged Header Banner") == 1
+    assert "Python | FastAPI | PostgreSQL" in result.markdown
 
 
 def test_extension_cannot_override_real_file_signature():
@@ -157,6 +198,41 @@ def test_pii_scrubber_removes_email_url_phone_and_11_digit_id():
     assert count_non_pii_text_characters(scrub_pii("12345678901 0944123456")) == 0
 
 
+def test_pii_scrubber_removes_local_two_group_and_intl_phone_formats():
+    raw = (
+        "Syrian mobile space: 0944 123456\n"
+        "Syrian mobile hyphen: 0944-123456\n"
+        "Damascus landline: (011) 2345678\n"
+        "Intl compact: +963 944123456\n"
+        "Intl two-part: +963 944 123456\n"
+        "Intl double-zero: 00963 944 123 456\n"
+        "Employment dates: 2020-2024 and 2024-05-15"
+    )
+    scrubbed = scrub_pii(raw)
+    for phone in (
+        "0944 123456",
+        "0944-123456",
+        "(011) 2345678",
+        "+963 944123456",
+        "+963 944 123456",
+        "00963 944 123 456",
+    ):
+        assert phone not in scrubbed
+    # Dates must not be misidentified as phone numbers.
+    assert "2020-2024" in scrubbed
+    assert "2024-05-15" in scrubbed
+
+
 def test_pii_scrubber_does_not_destroy_common_technology_names():
-    skills_text = "ASP.NET Core, VB.NET, Node.js, C++, React.js"
+    skills_text = (
+        "ASP.NET Core, VB.NET, ML.NET, Socket.io, Draw.io, "
+        "Node.js, C++, React.js, Flutter.dev"
+    )
     assert scrub_pii(skills_text) == skills_text
+
+    # Personal domains and path-bearing URLs must still be redacted.
+    urls_text = "Portfolio: alice.github.io, myportfolio.io, socket.io/users/alice"
+    scrubbed = scrub_pii(urls_text)
+    assert "alice.github.io" not in scrubbed
+    assert "myportfolio.io" not in scrubbed
+    assert "socket.io/users/alice" not in scrubbed

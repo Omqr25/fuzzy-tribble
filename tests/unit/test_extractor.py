@@ -59,6 +59,77 @@ def test_heading_fallback_extracts_all_contract_fields():
     assert 0.0 <= parsed.cv_completeness_score <= 1.0
 
 
+def test_heading_fallback_extracts_bold_and_italic_markdown_headings():
+    bold_markdown = """**Skills**
+- **Python**, **FastAPI**
+- PostgreSQL
+
+**Experience:**
+Built production microservices and automated CI/CD pipelines.
+
+__Education__
+BSc Software Engineering
+
+*Projects*
+- Distributed allocation service
+
+**Certifications**
+- CKA
+
+**Languages**
+- Arabic, English
+"""
+    parsed = extract_with_heading_fallback(bold_markdown)
+    assert parsed.skills == ["Python", "FastAPI", "PostgreSQL"]
+    assert "production microservices" in parsed.experience_summary
+    assert "BSc Software Engineering" in parsed.education_summary
+    assert "Distributed allocation service" in parsed.projects_summary
+    assert parsed.certifications == ["CKA"]
+    assert parsed.languages == ["Arabic", "English"]
+    assert parsed.cv_completeness_score == 1.0
+
+
+def test_heading_fallback_handles_title_case_with_conjunctions():
+    plain_markdown = """Education and Training
+BSc Information Technology, Damascus University
+
+Licenses and Certifications
+AWS Solutions Architect
+"""
+    parsed = extract_with_heading_fallback(plain_markdown)
+    assert "Damascus University" in parsed.education_summary
+    assert parsed.certifications == ["AWS Solutions Architect"]
+
+
+def test_heading_fallback_extracts_arabic_cv_sections():
+    arabic_markdown = """المهارات التقنية
+بايثون، فاست أي بي آي، قواعد بيانات
+
+**الخبرة العملية:**
+تطوير واجهات برمجية خلفية واختبار الأنظمة الموزعة.
+
+التعليم
+بكالوريوس هندسة معلوماتية
+
+أبرز المشاريع
+نظام مطابقة وتوزيع المتدربين
+
+الشهادات والدورات
+شهادة هندسة السحابة
+
+اللغات
+العربية، الإنجليزية
+"""
+    parsed = extract_with_heading_fallback(arabic_markdown)
+    assert parsed.skills == ["بايثون", "فاست أي بي آي", "قواعد بيانات"]
+    assert "واجهات برمجية" in parsed.experience_summary
+    assert "هندسة معلوماتية" in parsed.education_summary
+    assert "نظام مطابقة" in parsed.projects_summary
+    assert parsed.certifications == ["شهادة هندسة السحابة"]
+    assert parsed.languages == ["العربية", "الإنجليزية"]
+    assert parsed.cv_completeness_score == 1.0
+
+
 @pytest.mark.anyio
 async def test_llm_provider_result_is_validated_and_tagged_llm():
     provider = FakeProvider(
@@ -104,8 +175,8 @@ async def test_provider_timeout_uses_deterministic_fallback(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_openai_compatible_provider_retries_rate_limit_then_parses_schema():
-    calls = {"count": 0}
+async def test_openai_compatible_provider_retries_rate_limit_then_parses_schema(monkeypatch):
+    calls = {"count": 0, "clients_created": 0}
     parsed_json = json.dumps(
         {
             "skills": ["Python"],
@@ -118,12 +189,25 @@ async def test_openai_compatible_provider_retries_rate_limit_then_parses_schema(
         }
     )
 
+    real_async_client = httpx.AsyncClient
+
+    class CountingAsyncClient(real_async_client):
+        def __init__(self, *args, **kwargs):
+            calls["clients_created"] += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", CountingAsyncClient)
+
     def handler(request: httpx.Request) -> httpx.Response:
         calls["count"] += 1
         request_body = json.loads(request.content)
         strict_schema = request_body["response_format"]["json_schema"]["schema"]
+        assert strict_schema["additionalProperties"] is False
         assert set(strict_schema["required"]) == set(strict_schema["properties"])
-        assert all("default" not in value for value in strict_schema["properties"].values())
+        for prop in strict_schema["properties"].values():
+            assert "default" not in prop
+            assert "minimum" not in prop
+            assert "maximum" not in prop
         if calls["count"] == 1:
             return httpx.Response(429, json={"error": "rate limited"})
         return httpx.Response(
@@ -141,3 +225,4 @@ async def test_openai_compatible_provider_retries_rate_limit_then_parses_schema(
     result = await provider.extract(MARKDOWN)
     assert result.skills == ["Python"]
     assert calls["count"] == 2
+    assert calls["clients_created"] == 1

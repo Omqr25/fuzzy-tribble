@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import logging
 import re
@@ -242,6 +243,29 @@ def parse_cv(
     )
 
 
+def _supported_pymupdf4llm_kwargs(to_markdown_fn: object) -> dict[str, object]:
+    """Build keyword arguments supported by the installed pymupdf4llm version.
+
+    OCR is disabled when supported so short/scanned PDFs surface ``needs_ocr``
+    explicitly instead of silently triggering implicit OCR or failing with a
+    TypeError on versions without the ``use_ocr`` parameter.
+    """
+
+    desired: dict[str, object] = {"show_progress": False, "use_ocr": False}
+    try:
+        signature = inspect.signature(to_markdown_fn)
+    except (TypeError, ValueError):
+        return {"show_progress": False}
+
+    parameters = signature.parameters
+    accepts_var_kw = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+    if accepts_var_kw:
+        return desired
+    return {key: value for key, value in desired.items() if key in parameters}
+
+
 def _pdf_to_markdown(content: bytes) -> str:
     """Use PyMuPDF4LLM's layout-aware Markdown conversion."""
 
@@ -260,13 +284,8 @@ def _pdf_to_markdown(content: bytes) -> str:
                 "Password-protected or encrypted PDF files are not accepted.",
                 status_code=422,
             )
-        # OCR is deliberately disabled here: when the extracted text is too
-        # short, the API reports needs_ocr for an explicit downstream decision.
-        markdown = pymupdf4llm.to_markdown(
-            document,
-            show_progress=False,
-            use_ocr=False,
-        )
+        kwargs = _supported_pymupdf4llm_kwargs(pymupdf4llm.to_markdown)
+        markdown = pymupdf4llm.to_markdown(document, **kwargs)
     return str(markdown or "")
 
 
@@ -308,8 +327,17 @@ def _docx_to_markdown(content: bytes) -> str:
                 output.append(text)
         elif isinstance(block, Table):
             for row in block.rows:
-                cells = [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells]
-                cells = [cell for cell in cells if cell]
+                # Horizontally merged Word cells share the same underlying <w:tc>
+                # element; deduplicate by XML node identity to avoid repeating text.
+                cells: list[str] = []
+                seen_tc: set[object] = set()
+                for cell in row.cells:
+                    if cell._tc in seen_tc:
+                        continue
+                    seen_tc.add(cell._tc)
+                    cell_text = re.sub(r"\s+", " ", cell.text).strip()
+                    if cell_text:
+                        cells.append(cell_text)
                 if cells:
                     output.append(" | ".join(cells))
 
@@ -334,17 +362,43 @@ _EMAIL_RE = re.compile(
 _URL_RE = re.compile(
     r"(?i)\b(?:https?://|ftp://|www\.)[^\s<>()\[\]{}]+"
 )
+
+# Well-known technology names that look like bare domains without a URL path.
+# If followed by a path (e.g. ``socket.io/users/alice``) or scheme/email, they
+# are still redacted as URLs/emails.
+_TECH_DOMAIN_ALLOWLIST = (
+    r"(?:asp|vb|ml|paint)\.net"
+    r"|(?:socket|draw|swagger|redis|grpc|prisma|typeorm|angular|kubernetes"
+    r"|leaflet|expo|capacitor|ionic|sentry|storybook|cypress|playwright|fly)\.io"
+    r"|(?:flutter|dart|react|vite|vitejs|pydantic|web|go|deno|bun|astro|nuxt|svelte)\.dev"
+)
 _BARE_DOMAIN_RE = re.compile(
-    r"(?i)\b(?!(?:asp|vb)\.net\b)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    rf"(?i)\b(?!(?:{_TECH_DOMAIN_ALLOWLIST})\b(?!/))"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"(?:com\.sy|com|org|net|edu|gov|mil|int|io|co|me|info|biz|dev|app|uk|de|nl|sy)"
     r"(?:/[^\s<>()\[\]{}]*)?"
 )
 _NATIONAL_ID_RE = re.compile(r"(?<!\d)\d{11}(?!\d)")
-_PHONE_RE = re.compile(
-    r"(?<![\w])(?:\+\s?\d{1,3}[\s().-]?)?"
+
+# Three-group phone formats: +963 944 123 456, 00963 944 123 456, (011) 234 5678
+_PHONE_3GROUP_RE = re.compile(
+    r"(?<![\w])(?:(?:\+|00)\s?\d{1,3}[\s().-]?)?"
     r"(?:\(?\d{2,4}\)?[\s().-]?)\d{3,4}[\s.-]\d{3,4}(?!\w)"
 )
-_CONTIGUOUS_PHONE_RE = re.compile(r"(?<!\d)\+?\d{7,10}(?!\d)|(?<!\d)\+?\d{12,15}(?!\d)")
+# Two-group local/mobile/landline formats: 0944 123456, 0944-123456,
+# (011) 2345678, +963 944 123456. Requiring 6-9 trailing digits avoids matching
+# year ranges like 2020-2024 or ISO dates like 2024-05-15.
+_PHONE_2GROUP_RE = re.compile(
+    r"(?<![\w])(?:(?:\+|00)\s?\d{1,3}[\s().-]+)?"
+    r"\(?\d{2,4}\)?[\s.-]\d{6,9}(?!\w)"
+)
+# International country code followed by a single subscriber block: +963 944123456
+_PHONE_INTL_2GROUP_RE = re.compile(
+    r"(?<![\w])(?:\+|00)\s?\d{1,3}[\s().-]+\d{6,11}(?!\w)"
+)
+_CONTIGUOUS_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+|00)?\d{7,10}(?!\d)|(?<!\d)(?:\+|00)?\d{12,15}(?!\d)"
+)
 
 
 def count_non_pii_text_characters(scrubbed_markdown: str) -> int:
@@ -366,6 +420,8 @@ def scrub_pii(markdown: str) -> str:
     text = _URL_RE.sub("[REDACTED_URL]", text)
     text = _BARE_DOMAIN_RE.sub("[REDACTED_URL]", text)
     text = _NATIONAL_ID_RE.sub("[REDACTED_ID]", text)
-    text = _PHONE_RE.sub("[REDACTED_PHONE]", text)
+    text = _PHONE_3GROUP_RE.sub("[REDACTED_PHONE]", text)
+    text = _PHONE_2GROUP_RE.sub("[REDACTED_PHONE]", text)
+    text = _PHONE_INTL_2GROUP_RE.sub("[REDACTED_PHONE]", text)
     text = _CONTIGUOUS_PHONE_RE.sub("[REDACTED_PHONE]", text)
     return text
