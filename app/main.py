@@ -1,8 +1,12 @@
+import asyncio
+from contextlib import asynccontextmanager, suppress
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
+from starlette.concurrency import run_in_threadpool
+
 from app.api.v1 import allocations, candidates, health, positions
 from app.core.config import settings
 from app.core.logging import request_id_ctx, setup_logging
@@ -10,26 +14,52 @@ from app.core.logging import request_id_ctx, setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    try:
-        from app.services.embedder import EmbeddingService
 
-        service = EmbeddingService.load(settings.EMBEDDING_MODEL)
-        app.state.embedding_service = service
+async def _load_embedding_model_into_state(app: FastAPI, model_name: str) -> None:
+    """Load the embedding model without blocking server startup (/ready stays 503 while booting)."""
+    try:
+        from app.services.embedder import EmbeddingModel
+
+        model = await run_in_threadpool(EmbeddingModel, model_name)
+        app.state.embedding_model = model
+        app.state.embedding_model_version = model.model_version
         app.state.models_loaded = True
         logger.info(
             "Embedding model loaded: %s (dim=%d)",
-            service.model_version,
-            service.dimension,
+            model.model_version,
+            model.dimension,
         )
+    except asyncio.CancelledError:
+        logger.info("Embedding model loading cancelled during shutdown")
+        raise
     except Exception:
         logger.exception(
-            "Failed to load embedding model '%s'", settings.EMBEDDING_MODEL
+            "Failed to load embedding model '%s'; the service will run "
+            "without embedding capabilities",
+            model_name,
         )
-        app.state.embedding_service = None
-        app.state.models_loaded = False
-    yield
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.models_loaded = False
+    app.state.embedding_model = None
+    app.state.embedding_model_version = "none"
+    load_task: asyncio.Task[None] | None = None
+
+    if settings.EMBEDDING_MODEL:
+        load_task = asyncio.create_task(
+            _load_embedding_model_into_state(app, settings.EMBEDDING_MODEL)
+        )
+        app.state.model_load_task = load_task
+
+    try:
+        yield
+    finally:
+        if load_task is not None and not load_task.done():
+            load_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await load_task
 
 
 app = FastAPI(
@@ -37,6 +67,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -52,6 +83,7 @@ async def request_id_middleware(request: Request, call_next):
 
     response.headers["X-Request-ID"] = req_id
     return response
+
 
 app.include_router(health.router)
 app.include_router(positions.router)

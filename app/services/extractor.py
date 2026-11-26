@@ -378,6 +378,23 @@ def _is_title_like(text: str) -> bool:
             return False
     return True
 
+def _match_inline_heading(
+    prefix: str,
+    remainder: str,
+    *,
+    require_title_like: bool,
+) -> tuple[str, str | None] | None:
+    cleaned_prefix = prefix.strip()
+    if not cleaned_prefix or len(cleaned_prefix) > 60 or len(cleaned_prefix.split()) > 7:
+        return None
+    section = _classify_heading(cleaned_prefix)
+    if section is None:
+        return None
+    if require_title_like and _LATIN_LETTER_RE.search(cleaned_prefix) and not _is_title_like(cleaned_prefix):
+        return None
+    return section, remainder.strip() or None
+
+
 def _extract_plain_heading_section(line: str) -> tuple[str, str | None] | None:
     """Identify standalone or inline (``Heading: value``) section headings."""
 
@@ -385,44 +402,57 @@ def _extract_plain_heading_section(line: str) -> tuple[str, str | None] | None:
     if not stripped or _BULLET_LINE_RE.match(stripped):
         return None
 
-    # First check inline emphasized/plain headings such as ``**Skills:** Python``
-    # or ``Languages: Arabic, English`` before testing standalone lines.
+    # Check inline emphasized headings (e.g. ``**Skills:** Python``) first.
     inline_emphasis = _INLINE_EMPHASIS_HEADING_RE.match(stripped)
     if inline_emphasis:
-        prefix = inline_emphasis.group("prefix").strip()
-        remainder = inline_emphasis.group("remainder").strip()
-        if prefix and len(prefix) <= 60 and len(prefix.split()) <= 7:
-            section = _classify_heading(prefix)
-            if section is not None:
-                return section, remainder or None
+        match = _match_inline_heading(
+            inline_emphasis.group("prefix"),
+            inline_emphasis.group("remainder"),
+            require_title_like=False,
+        )
+        if match is not None:
+            return match
 
-    is_emphasized = False
+    # Check emphasis-wrapped headings (e.g. ``**Experience:**`` or ``**Skills: Python**``)
+    # before plain inline headings so trailing emphasis markers are not read as content.
     emphasis_match = _EMPHASIS_WRAPPED_RE.match(stripped)
     if emphasis_match:
-        candidate = emphasis_match.group("inner").strip().strip(":")
-        is_emphasized = True
-    else:
-        candidate = stripped.strip(":")
+        inner = emphasis_match.group("inner").strip()
+        inline_inner = _INLINE_PLAIN_HEADING_RE.match(inner)
+        if inline_inner:
+            match = _match_inline_heading(
+                inline_inner.group("prefix"),
+                inline_inner.group("remainder"),
+                require_title_like=False,
+            )
+            if match is not None:
+                return match
+        candidate = inner.strip(":").strip()
+        if candidate and len(candidate) <= 60 and len(candidate.split()) <= 7:
+            section = _classify_heading(candidate)
+            if section is not None:
+                return section, None
+        return None
 
+    # Check plain inline headings (e.g. ``Languages: Arabic, English``) BEFORE the
+    # standalone branch, because _normalize_heading strips ``:.*$``.
+    inline_plain = _INLINE_PLAIN_HEADING_RE.match(stripped)
+    if inline_plain:
+        match = _match_inline_heading(
+            inline_plain.group("prefix"),
+            inline_plain.group("remainder"),
+            require_title_like=True,
+        )
+        if match is not None:
+            return match
+
+    candidate = stripped.strip(":").strip()
     if candidate and len(candidate) <= 60 and len(candidate.split()) <= 7:
         section = _classify_heading(candidate)
         if section is not None and (
-            is_emphasized
-            or not _LATIN_LETTER_RE.search(candidate)
-            or _is_title_like(candidate)
+            not _LATIN_LETTER_RE.search(candidate) or _is_title_like(candidate)
         ):
             return section, None
-
-    inline_plain = _INLINE_PLAIN_HEADING_RE.match(stripped)
-    if inline_plain:
-        prefix = inline_plain.group("prefix").strip()
-        remainder = inline_plain.group("remainder").strip()
-        if prefix and len(prefix) <= 60 and len(prefix.split()) <= 7:
-            section = _classify_heading(prefix)
-            if section is not None and (
-                not _LATIN_LETTER_RE.search(prefix) or _is_title_like(prefix)
-            ):
-                return section, remainder or None
 
     return None
 

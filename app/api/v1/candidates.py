@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
@@ -25,8 +25,6 @@ router = APIRouter(
     dependencies=[Depends(verify_api_key)],
 )
 
-NO_EMBEDDING_MODEL_VERSION = "no_model_loaded"
-
 
 @router.post("/ingest", response_model=CandidateIngestResponse)
 async def ingest_candidate(
@@ -41,6 +39,15 @@ async def ingest_candidate(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=exc.errors(),
         ) from exc
+
+    embedding_model = getattr(request.app.state, "embedding_model", None)
+    if embedding_model is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding model is not loaded; the service is not ready.",
+        )
+
+    model_version = embedding_model.model_version
 
     try:
         content = await cv_file.read(settings.CV_MAX_FILE_SIZE_BYTES + 1)
@@ -67,7 +74,7 @@ async def ingest_candidate(
             extraction_error=str(exc),
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
 
     scrubbed_markdown = scrub_pii(parsed_document.markdown)
@@ -84,7 +91,7 @@ async def ingest_candidate(
             ),
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
 
     provider = getattr(request.app.state, "cv_extraction_provider", None)
@@ -108,28 +115,27 @@ async def ingest_candidate(
             extraction_error="Structured extraction and deterministic fallback both failed.",
             parsed_cv=None,
             vectors=None,
-            model_version=NO_EMBEDDING_MODEL_VERSION,
+            model_version=model_version,
         )
 
-    # Phase 4: generate faceted embeddings when the model is available.
-    embedding_model = getattr(request.app.state, "embedding_model", None)
-    vectors = None
-    model_version = NO_EMBEDDING_MODEL_VERSION
-
-    if embedding_model is not None:
-        try:
-            vectors = await run_in_threadpool(
-                build_candidate_vectors,
-                parsed_metadata,
-                extraction.parsed_cv,
-                embedding_model,
-            )
-            model_version = embedding_model.model_version
-        except Exception:
-            logger.exception(
-                "Embedding generation failed for candidate %s",
-                parsed_metadata.candidate_id,
-            )
+    # Never mark extraction_status="completed" with vectors=None; callers rely on
+    # non-null vectors for Phase 5 allocation and retry on 5xx responses.
+    try:
+        vectors = await run_in_threadpool(
+            build_candidate_vectors,
+            parsed_metadata,
+            extraction.parsed_cv,
+            embedding_model,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Embedding generation failed for candidate %s",
+            parsed_metadata.candidate_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Candidate embedding generation failed.",
+        ) from exc
 
     return CandidateIngestResponse(
         candidate_id=parsed_metadata.candidate_id,

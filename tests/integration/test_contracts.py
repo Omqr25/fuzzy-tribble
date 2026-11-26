@@ -1,6 +1,10 @@
 import hashlib
 import io
 import json
+import sys
+import threading
+import time
+import types
 
 import pymupdf
 import pytest
@@ -12,37 +16,24 @@ from app.core.config import settings
 from app.main import app
 from app.schemas.candidate import ParsedCV
 from app.services.parser import CVParsingError
-from tests.conftest import FakeEmbeddingModel
+from tests.conftest import FakeSentenceTransformer, make_fake_embedding_model
 
 AUTH_HEADERS = {"X-API-Key": settings.INTERNAL_API_KEY}
 
 
 @pytest.fixture
 def client(monkeypatch):
-    # Prevent integration tests from loading the real embedding model or
-    # making live LLM requests when local .env defines their settings.
+    # Prevent integration tests from downloading the real model or calling a
+    # live LLM when local .env defines their settings.
     monkeypatch.setattr(settings, "EMBEDDING_MODEL", "")
     monkeypatch.setattr(settings, "EXTRACTION_LLM_BASE_URL", None)
     monkeypatch.setattr(settings, "EXTRACTION_LLM_MODEL", None)
     monkeypatch.setattr(settings, "EXTRACTION_LLM_API_KEY", None)
     with TestClient(app) as test_client:
-        yield test_client
-
-
-@pytest.fixture
-def client_with_embeddings(monkeypatch):
-    """TestClient backed by a lightweight fake embedding model."""
-    monkeypatch.setattr(settings, "EMBEDDING_MODEL", "")
-    monkeypatch.setattr(settings, "EXTRACTION_LLM_BASE_URL", None)
-    monkeypatch.setattr(settings, "EXTRACTION_LLM_MODEL", None)
-    monkeypatch.setattr(settings, "EXTRACTION_LLM_API_KEY", None)
-    with TestClient(app) as test_client:
-        fake = FakeEmbeddingModel(dimension=4)
-        monkeypatch.setattr(app.state, "embedding_model", fake, raising=False)
-        monkeypatch.setattr(
-            app.state, "embedding_model_version", fake.model_version, raising=False
-        )
-        monkeypatch.setattr(app.state, "models_loaded", True, raising=False)
+        fake_model = make_fake_embedding_model(dimension=4)
+        app.state.embedding_model = fake_model
+        app.state.embedding_model_version = fake_model.model_version
+        app.state.models_loaded = True
         yield test_client
 
 
@@ -112,7 +103,7 @@ def _sample_position(position_id: str = "p1", min_seats: int = 0, max_seats: int
     }
 
 
-# ── Health & Auth ──────────────────────────────────────────────────────────
+# ── Health, Lifespan & Auth ────────────────────────────────────────────────
 
 
 def test_health_and_ready_probes(client):
@@ -120,10 +111,77 @@ def test_health_and_ready_probes(client):
     assert health_res.status_code == 200
     assert "X-Request-ID" in health_res.headers
 
+    assert client.get("/ready").status_code == 200
+    app.state.models_loaded = False
     assert client.get("/ready").status_code == 503
     app.state.models_loaded = True
     assert client.get("/ready").status_code == 200
-    app.state.models_loaded = False
+
+
+def test_lifespan_loads_model_asynchronously_and_transitions_ready(monkeypatch):
+    load_started = threading.Event()
+    allow_load_finish = threading.Event()
+
+    class StubSentenceTransformer(FakeSentenceTransformer):
+        def __init__(self, model_name: str) -> None:
+            load_started.set()
+            assert allow_load_finish.wait(timeout=5.0)
+            super().__init__(dimension=4)
+
+    fake_st_module = types.ModuleType("sentence_transformers")
+    fake_st_module.SentenceTransformer = StubSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st_module)
+    monkeypatch.setattr(settings, "EMBEDDING_MODEL", "BAAI/bge-m3")
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_BASE_URL", None)
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_MODEL", None)
+    monkeypatch.setattr(settings, "EXTRACTION_LLM_API_KEY", None)
+
+    with TestClient(app) as live_client:
+        assert load_started.wait(timeout=2.0)
+        # While loading in background, /health is alive and /ready reports 503.
+        assert live_client.get("/health").status_code == 200
+        assert live_client.get("/ready").status_code == 503
+
+        allow_load_finish.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if live_client.get("/ready").status_code == 200:
+                break
+            time.sleep(0.01)
+
+        assert live_client.get("/ready").status_code == 200
+        res = live_client.post(
+            "/api/v1/positions/embed",
+            json={
+                "position_id": "pos-live",
+                "title": "Backend Intern",
+                "required_skills": ["Python"],
+            },
+            headers=AUTH_HEADERS,
+        )
+        assert res.status_code == 200
+        assert res.json()["model_version"] == "BAAI/bge-m3"
+
+
+def test_lifespan_keeps_ready_at_503_when_model_load_fails(monkeypatch):
+    load_attempted = threading.Event()
+
+    def failing_loader(model_name: str):
+        load_attempted.set()
+        raise RuntimeError("weights missing")
+
+    fake_st_module = types.ModuleType("sentence_transformers")
+    fake_st_module.SentenceTransformer = failing_loader
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st_module)
+    monkeypatch.setattr(settings, "EMBEDDING_MODEL", "BAAI/bge-m3")
+
+    with TestClient(app) as live_client:
+        assert load_attempted.wait(timeout=2.0)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not live_client.app.state.model_load_task.done():
+            time.sleep(0.01)
+        assert live_client.get("/health").status_code == 200
+        assert live_client.get("/ready").status_code == 503
 
 
 def test_protected_routes_reject_missing_or_wrong_api_key(client):
@@ -146,20 +204,42 @@ def test_position_embed_rejects_invalid_payload(client):
 
 
 def test_position_embed_returns_503_without_model(client):
+    saved = app.state.embedding_model
+    app.state.embedding_model = None
+    try:
+        res = client.post(
+            "/api/v1/positions/embed",
+            json={
+                "position_id": "pos-1",
+                "title": "Backend Intern",
+                "required_skills": ["PHP", "Laravel", "MySQL"],
+            },
+            headers=AUTH_HEADERS,
+        )
+        assert res.status_code == 503
+    finally:
+        app.state.embedding_model = saved
+
+
+def test_position_embed_returns_500_when_embedding_raises(client, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("encoder error")
+
+    monkeypatch.setattr(app.state.embedding_model, "encode_texts", boom)
     res = client.post(
         "/api/v1/positions/embed",
         json={
             "position_id": "pos-1",
             "title": "Backend Intern",
-            "required_skills": ["PHP", "Laravel", "MySQL"],
+            "required_skills": ["Python"],
         },
         headers=AUTH_HEADERS,
     )
-    assert res.status_code == 503
+    assert res.status_code == 500
 
 
-def test_position_embed_returns_vectors_with_model(client_with_embeddings):
-    res = client_with_embeddings.post(
+def test_position_embed_returns_vectors_with_model(client):
+    res = client.post(
         "/api/v1/positions/embed",
         json={
             "position_id": "pos-1",
@@ -209,8 +289,40 @@ def test_candidate_ingest_multipart_contract(client):
     assert payload["extraction_status"] == "completed"
     assert payload["extraction_method"] == "fallback_heuristic"
     assert payload["parsed_cv"]["skills"] == ["Python", "FastAPI", "PostgreSQL"]
-    assert payload["vectors"] is None  # No embedding model loaded in this test fixture.
-    assert payload["model_version"] == "no_model_loaded"
+    assert payload["vectors"] is not None
+    assert len(payload["vectors"]["skills"]) == 4
+    assert len(payload["vectors"]["academic"]) == 4
+    assert len(payload["vectors"]["practical"]) == 4
+    assert payload["model_version"] == "fake-test-model"
+
+
+def test_candidate_ingest_returns_503_without_embedding_model(client):
+    saved = app.state.embedding_model
+    app.state.embedding_model = None
+    try:
+        res = client.post(
+            "/api/v1/candidates/ingest",
+            headers=AUTH_HEADERS,
+            files={"cv_file": ("cv.docx", make_docx(), "application/octet-stream")},
+            data={"metadata": json.dumps({"candidate_id": "cand-unready"})},
+        )
+        assert res.status_code == 503
+    finally:
+        app.state.embedding_model = saved
+
+
+def test_candidate_ingest_embedding_failure_returns_500(client, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("OOM during encode")
+
+    monkeypatch.setattr(app.state.embedding_model, "encode_texts", boom)
+    res = client.post(
+        "/api/v1/candidates/ingest",
+        headers=AUTH_HEADERS,
+        files={"cv_file": ("cv.docx", make_docx(), "application/octet-stream")},
+        data={"metadata": json.dumps({"candidate_id": "cand-oom"})},
+    )
+    assert res.status_code == 500
 
 
 def test_candidate_ingest_real_pdf_end_to_end(client):
@@ -231,6 +343,8 @@ def test_candidate_ingest_real_pdf_end_to_end(client):
     assert "ML.NET" in payload["parsed_cv"]["skills"]
     assert "0944 123456" not in payload["parsed_cv"]["experience_summary"]
     assert "2020-2024" in payload["parsed_cv"]["education_summary"]
+    assert payload["vectors"] is not None
+    assert payload["model_version"] == "fake-test-model"
 
 
 def test_candidate_ingest_arabic_docx_end_to_end(client):
@@ -260,6 +374,8 @@ def test_candidate_ingest_arabic_docx_end_to_end(client):
     assert payload["parsed_cv"]["skills"] == ["بايثون", "فاست أي بي آي", "دوكر"]
     assert "جامعة دمشق" in payload["parsed_cv"]["education_summary"]
     assert payload["parsed_cv"]["cv_completeness_score"] > 0.0
+    assert payload["vectors"] is not None
+    assert payload["model_version"] == "fake-test-model"
 
 
 def test_candidate_pii_is_scrubbed_before_provider_call(client, monkeypatch):
@@ -320,6 +436,7 @@ def test_candidate_ingest_short_document_returns_needs_ocr(client):
     assert payload["extraction_status"] == "needs_ocr"
     assert payload["extraction_method"] == "none"
     assert payload["parsed_cv"] is None
+    assert payload["vectors"] is None
     assert "OCR" in payload["extraction_error"]
 
 
@@ -342,6 +459,7 @@ def test_candidate_ingest_surfaces_document_conversion_failure(client, monkeypat
     assert payload["extraction_status"] == "failed"
     assert payload["extraction_method"] == "none"
     assert payload["cv_hash"] == "a" * 64
+    assert payload["vectors"] is None
     assert "could not be converted" in payload["extraction_error"]
 
 
@@ -377,7 +495,7 @@ def test_candidate_ingest_rejects_malformed_json_metadata(client):
     assert res.status_code == 422
 
 
-# ── Allocation stubs ───────────────────────────────────────────────────────
+# ── Allocation stubs (Phase 5–6) ───────────────────────────────────────────
 
 
 def test_allocation_solve_valid_payload_returns_501(client):
@@ -434,47 +552,3 @@ def test_allocation_explain_contract(client):
         headers=AUTH_HEADERS,
     )
     assert good.status_code == 501
-
-
-# ── Phase 4: Embedding integration tests ──────────────────────────────────
-
-
-def test_candidate_ingest_produces_vectors_when_model_loaded(client_with_embeddings):
-    content = make_docx()
-    res = client_with_embeddings.post(
-        "/api/v1/candidates/ingest",
-        headers=AUTH_HEADERS,
-        files={"cv_file": ("cv.docx", content, "application/octet-stream")},
-        data={
-            "metadata": json.dumps(
-                {
-                    "candidate_id": "cand-vec",
-                    "technical_skills": ["Python", "FastAPI"],
-                    "program": "Computer Science",
-                }
-            )
-        },
-    )
-    assert res.status_code == 200, res.text
-    payload = res.json()
-    assert payload["extraction_status"] == "completed"
-    assert payload["vectors"] is not None
-    assert len(payload["vectors"]["skills"]) == 4
-    assert len(payload["vectors"]["academic"]) == 4
-    assert len(payload["vectors"]["practical"]) == 4
-    assert payload["model_version"] == "fake-test-model"
-
-
-def test_candidate_ingest_needs_ocr_skips_embeddings(client_with_embeddings):
-    """Even with model loaded, needs_ocr documents must not produce vectors."""
-    content = make_docx(text="Too short")
-    res = client_with_embeddings.post(
-        "/api/v1/candidates/ingest",
-        headers=AUTH_HEADERS,
-        files={"cv_file": ("cv.docx", content, "application/octet-stream")},
-        data={"metadata": json.dumps({"candidate_id": "cand-ocr-vec"})},
-    )
-    assert res.status_code == 200
-    payload = res.json()
-    assert payload["extraction_status"] == "needs_ocr"
-    assert payload["vectors"] is None

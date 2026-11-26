@@ -103,11 +103,14 @@ AWS Solutions Architect
 
 def test_heading_fallback_extracts_inline_headings():
     inline_markdown = """**Skills:** Python, Socket.io, ML.NET
+**Experience:**
+Built production APIs.
 Languages: Arabic, English
 المشاريع: نظام مطابقة وتوزيع المتدربين
 """
     parsed = extract_with_heading_fallback(inline_markdown)
     assert parsed.skills == ["Python", "Socket.io", "ML.NET"]
+    assert "Built production APIs" in parsed.experience_summary
     assert parsed.languages == ["Arabic", "English"]
     assert "نظام مطابقة" in parsed.projects_summary
 

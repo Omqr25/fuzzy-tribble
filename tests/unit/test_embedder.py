@@ -4,7 +4,9 @@ import pytest
 from app.schemas.candidate import CandidateMetadata, ParsedCV
 from app.schemas.position import FacetedVectors, PositionEmbedRequest
 from app.services.embedder import (
-    EmbeddingService,
+    EmbeddingModel,
+    build_candidate_vectors,
+    build_position_vectors,
     compose_candidate_academic_text,
     compose_candidate_practical_text,
     compose_candidate_skills_text,
@@ -12,11 +14,7 @@ from app.services.embedder import (
     compose_position_practical_text,
     compose_position_skills_text,
 )
-
-
-# ---------------------------------------------------------------------------
-# Text composition
-# ---------------------------------------------------------------------------
+from tests.conftest import FakeSentenceTransformer
 
 
 class TestCandidateTextComposition:
@@ -27,31 +25,34 @@ class TestCandidateTextComposition:
     def _cv(self, **overrides) -> ParsedCV:
         return ParsedCV(**overrides)
 
-    def test_skills_combines_db_and_cv_skills(self):
-        meta = self._meta(technical_skills=["Python", "SQL"])
-        cv = self._cv(skills=["FastAPI", "Docker"])
-        assert compose_candidate_skills_text(meta, cv) == "Python, SQL, FastAPI, Docker"
+    def test_skills_combines_strips_and_deduplicates_case_insensitively(self):
+        meta = self._meta(technical_skills=["  Python ", "SQL", "   "])
+        cv = self._cv(skills=["python", "FastAPI", "sql", "Docker "])
+        assert (
+            compose_candidate_skills_text(meta, cv)
+            == "Python, SQL, FastAPI, Docker"
+        )
 
-    def test_skills_empty_when_no_skills(self):
-        assert compose_candidate_skills_text(self._meta(), self._cv()) == ""
+    def test_skills_empty_when_no_or_blank_skills(self):
+        meta = self._meta(technical_skills=["  ", ""])
+        cv = self._cv(skills=["\t"])
+        assert compose_candidate_skills_text(meta, cv) == ""
 
-    def test_academic_combines_all_fields(self):
+    def test_academic_combines_all_fields_and_ignores_whitespace(self):
         meta = self._meta(
-            program="BSc",
-            field="Engineering",
+            program=" BSc ",
+            field="   ",
             major="CS",
             year_of_study=3,
         )
-        cv = self._cv(education_summary="Damascus University")
+        cv = self._cv(education_summary=" Damascus University ")
         result = compose_candidate_academic_text(meta, cv)
-        assert "BSc" in result
-        assert "Engineering" in result
-        assert "CS" in result
-        assert "year 3" in result
-        assert "Damascus University" in result
+        assert result == "BSc CS year of study 3 Damascus University"
 
-    def test_academic_empty_when_no_fields(self):
-        assert compose_candidate_academic_text(self._meta(), self._cv()) == ""
+    def test_academic_empty_when_whitespace_only(self):
+        meta = self._meta(program="  ", field="\n", major="")
+        cv = self._cv(education_summary="   ")
+        assert compose_candidate_academic_text(meta, cv) == ""
 
     def test_practical_combines_experience_projects_additional(self):
         meta = self._meta(additional_info="Available immediately")
@@ -60,12 +61,12 @@ class TestCandidateTextComposition:
             projects_summary="Matching engine",
         )
         result = compose_candidate_practical_text(meta, cv)
-        assert "Built APIs" in result
-        assert "Matching engine" in result
-        assert "Available immediately" in result
+        assert result == "Built APIs Matching engine Available immediately"
 
-    def test_practical_empty_when_no_fields(self):
-        assert compose_candidate_practical_text(self._meta(), self._cv()) == ""
+    def test_practical_empty_when_whitespace_only(self):
+        meta = self._meta(additional_info="  ")
+        cv = self._cv(experience_summary="", projects_summary="\t")
+        assert compose_candidate_practical_text(meta, cv) == ""
 
 
 class TestPositionTextComposition:
@@ -73,10 +74,10 @@ class TestPositionTextComposition:
         defaults = {"position_id": "p1", "title": "Intern"}
         return PositionEmbedRequest(**(defaults | overrides))
 
-    def test_skills_combines_required_and_preferred(self):
+    def test_skills_combines_strips_and_deduplicates(self):
         req = self._req(
-            required_skills=["Python", "SQL"],
-            preferred_skills=["Docker"],
+            required_skills=[" Python", "SQL", " "],
+            preferred_skills=["sql", "Docker"],
         )
         assert compose_position_skills_text(req) == "Python, SQL, Docker"
 
@@ -85,120 +86,166 @@ class TestPositionTextComposition:
 
     def test_academic_combines_majors_and_level(self):
         req = self._req(
-            target_majors=["CS", "IT"],
-            academic_level="Bachelor",
+            target_majors=[" CS ", "cs", "IT"],
+            academic_level=" Bachelor ",
         )
-        result = compose_position_academic_text(req)
-        assert "CS, IT" in result
-        assert "Bachelor" in result
+        assert compose_position_academic_text(req) == "CS, IT Bachelor"
 
-    def test_practical_combines_responsibilities_and_level(self):
-        req = self._req(
+    def test_practical_prefers_responsibilities_and_falls_back_to_description(self):
+        with_resp = self._req(
             responsibilities="Build backend APIs",
+            description="General team description",
             experience_level="Junior",
         )
-        result = compose_position_practical_text(req)
-        assert "Build backend APIs" in result
-        assert "Junior" in result
+        assert compose_position_practical_text(with_resp) == "Build backend APIs Junior"
+
+        fallback_desc = self._req(
+            responsibilities="   ",
+            description="Develop microservices",
+            experience_level="Junior",
+        )
+        assert compose_position_practical_text(fallback_desc) == "Develop microservices Junior"
+
+        minimal = self._req()
+        assert compose_position_practical_text(minimal) == ""
 
 
-# ---------------------------------------------------------------------------
-# EmbeddingService with a fake model
-# ---------------------------------------------------------------------------
-
-
-class _FakeModel:
-    """Mimics the ``sentence_transformers.SentenceTransformer`` interface."""
-
-    def __init__(self, dimension: int = 8) -> None:
-        self._dimension = dimension
-
-    def get_sentence_embedding_dimension(self) -> int:
-        return self._dimension
-
-    def encode(
-        self,
-        sentences,
-        *,
-        normalize_embeddings: bool = True,
-        show_progress_bar: bool = False,
-    ) -> np.ndarray:
-        seed = hash(tuple(sentences)) % 2**32
-        rng = np.random.default_rng(seed)
-        vectors = rng.standard_normal((len(sentences), self._dimension))
-        if normalize_embeddings:
-            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-            vectors = vectors / np.where(norms == 0, 1, norms)
-        return vectors
-
-
-class TestEmbeddingService:
+class TestEmbeddingModel:
     @pytest.fixture()
-    def service(self) -> EmbeddingService:
-        return EmbeddingService(_FakeModel(dimension=8), model_name="test-model")
+    def backend(self) -> FakeSentenceTransformer:
+        return FakeSentenceTransformer(dimension=8)
 
-    def test_model_version_and_dimension(self, service):
-        assert service.model_version == "test-model"
-        assert service.dimension == 8
+    @pytest.fixture()
+    def model(self, backend: FakeSentenceTransformer) -> EmbeddingModel:
+        return EmbeddingModel("BAAI/bge-m3", _model=backend)
 
-    def test_encode_returns_normalised_vectors(self, service):
-        vectors = service.encode(["hello", "world"])
+    def test_model_version_and_dimension(self, model: EmbeddingModel):
+        assert model.model_version == "BAAI/bge-m3"
+        assert model.dimension == 8
+
+    def test_encode_passes_normalize_embeddings_true_and_returns_unit_vectors(
+        self, model: EmbeddingModel, backend: FakeSentenceTransformer
+    ):
+        vectors = model.encode_texts(["hello", "world"])
         assert len(vectors) == 2
+        assert len(backend.calls) == 1
+        assert backend.calls[0]["normalize_embeddings"] is True
+        assert backend.calls[0]["show_progress_bar"] is False
         for vec in vectors:
             assert len(vec) == 8
             norm = sum(x**2 for x in vec) ** 0.5
             assert abs(norm - 1.0) < 1e-6
 
-    def test_encode_handles_empty_and_whitespace_text(self, service):
-        vectors = service.encode(["", "   ", "valid text"])
-        assert len(vectors) == 3
-        for vec in vectors:
-            assert len(vec) == 8
+    def test_encode_returns_empty_list_for_empty_input(
+        self, model: EmbeddingModel, backend: FakeSentenceTransformer
+    ):
+        assert model.encode_texts([]) == []
+        assert backend.calls == []
 
-    def test_embed_position_returns_faceted_vectors(self, service):
-        req = PositionEmbedRequest(
+    def test_encode_maps_empty_and_whitespace_texts_to_zero_vectors(
+        self, model: EmbeddingModel, backend: FakeSentenceTransformer
+    ):
+        vectors = model.encode_texts(["", "   ", "valid text"])
+        assert len(vectors) == 3
+        assert vectors[0] == [0.0] * 8
+        assert vectors[1] == [0.0] * 8
+        assert abs(sum(x**2 for x in vectors[2]) ** 0.5 - 1.0) < 1e-6
+        assert backend.calls[0]["sentences"] == ["valid text"]
+
+    def test_encode_skips_backend_when_all_texts_empty(
+        self, model: EmbeddingModel, backend: FakeSentenceTransformer
+    ):
+        vectors = model.encode_texts(["", "  "])
+        assert vectors == [[0.0] * 8, [0.0] * 8]
+        assert backend.calls == []
+
+    def test_empty_facets_produce_zero_dot_product_similarity(
+        self, model: EmbeddingModel
+    ):
+        cand_vecs = build_candidate_vectors(
+            CandidateMetadata(candidate_id="c1", technical_skills=["Python"]),
+            ParsedCV(),
+            model,
+        )
+        empty_pos_vecs = build_position_vectors(
+            PositionEmbedRequest(position_id="p1", title="Intern"),
+            model,
+        )
+        # Missing facets must evaluate to exact 0.0 in dot products.
+        assert empty_pos_vecs.skills == [0.0] * 8
+        assert empty_pos_vecs.academic == [0.0] * 8
+        assert empty_pos_vecs.practical == [0.0] * 8
+        assert cand_vecs.academic == [0.0] * 8
+        assert cand_vecs.practical == [0.0] * 8
+        assert float(np.dot(cand_vecs.skills, empty_pos_vecs.skills)) == 0.0
+        assert float(np.dot(cand_vecs.academic, empty_pos_vecs.academic)) == 0.0
+
+    def test_embed_position_and_candidate_return_faceted_vectors(
+        self, model: EmbeddingModel
+    ):
+        pos = PositionEmbedRequest(
             position_id="p1",
             title="Backend Intern",
             required_skills=["Python"],
+            target_majors=["Computer Science"],
+            responsibilities="Build APIs",
         )
-        result = service.embed_position(req)
-        assert isinstance(result, FacetedVectors)
-        assert len(result.skills) == 8
-        assert len(result.academic) == 8
-        assert len(result.practical) == 8
-
-    def test_embed_candidate_returns_faceted_vectors(self, service):
-        meta = CandidateMetadata(candidate_id="c1", technical_skills=["Python"])
-        cv = ParsedCV(skills=["FastAPI"], experience_summary="Built APIs")
-        result = service.embed_candidate(meta, cv)
-        assert isinstance(result, FacetedVectors)
-        assert len(result.skills) == 8
-        assert len(result.academic) == 8
-        assert len(result.practical) == 8
-
-    def test_embed_candidate_with_all_empty_fields(self, service):
-        meta = CandidateMetadata(candidate_id="c1")
-        cv = ParsedCV()
-        result = service.embed_candidate(meta, cv)
-        assert isinstance(result, FacetedVectors)
-        # Every facet should still produce a valid normalised vector.
-        for vec in (result.skills, result.academic, result.practical):
+        pos_vecs = build_position_vectors(pos, model)
+        assert isinstance(pos_vecs, FacetedVectors)
+        for vec in (pos_vecs.skills, pos_vecs.academic, pos_vecs.practical):
             assert len(vec) == 8
-            norm = sum(x**2 for x in vec) ** 0.5
-            assert abs(norm - 1.0) < 1e-6
+            assert abs(sum(x**2 for x in vec) ** 0.5 - 1.0) < 1e-6
 
-    def test_different_inputs_produce_different_vectors(self, service):
-        req_a = PositionEmbedRequest(
-            position_id="p1",
-            title="Backend Intern",
-            required_skills=["Python", "Django"],
+        cand_vecs = build_candidate_vectors(
+            CandidateMetadata(
+                candidate_id="c1",
+                technical_skills=["Python"],
+                major="Computer Science",
+            ),
+            ParsedCV(skills=["FastAPI"], experience_summary="Built APIs"),
+            model,
         )
-        req_b = PositionEmbedRequest(
-            position_id="p2",
-            title="Frontend Intern",
-            required_skills=["JavaScript", "React"],
+        assert isinstance(cand_vecs, FacetedVectors)
+        for vec in (cand_vecs.skills, cand_vecs.academic, cand_vecs.practical):
+            assert len(vec) == 8
+            assert abs(sum(x**2 for x in vec) ** 0.5 - 1.0) < 1e-6
+
+    def test_e5_model_applies_query_and_passage_prefixes_only_to_non_empty_facets(self):
+        backend = FakeSentenceTransformer(dimension=8)
+        e5_model = EmbeddingModel("intfloat/multilingual-e5-base", _model=backend)
+
+        build_position_vectors(
+            PositionEmbedRequest(
+                position_id="p1",
+                title="Backend",
+                required_skills=["Python"],
+            ),
+            e5_model,
         )
-        vec_a = service.embed_position(req_a)
-        vec_b = service.embed_position(req_b)
-        # At least the skills facet should differ for different skill sets.
+        build_candidate_vectors(
+            CandidateMetadata(candidate_id="c1", technical_skills=["Python"]),
+            ParsedCV(experience_summary="Built APIs"),
+            e5_model,
+        )
+
+        assert backend.calls[0]["sentences"] == ["query: Python"]
+        assert backend.calls[1]["sentences"] == ["passage: Python", "passage: Built APIs"]
+
+    def test_different_inputs_produce_different_vectors(self, model: EmbeddingModel):
+        vec_a = build_position_vectors(
+            PositionEmbedRequest(
+                position_id="p1",
+                title="Backend Intern",
+                required_skills=["Python", "Django"],
+            ),
+            model,
+        )
+        vec_b = build_position_vectors(
+            PositionEmbedRequest(
+                position_id="p2",
+                title="Frontend Intern",
+                required_skills=["JavaScript", "React"],
+            ),
+            model,
+        )
         assert vec_a.skills != vec_b.skills

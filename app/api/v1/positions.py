@@ -27,7 +27,17 @@ async def embed_position(
             detail="Embedding model is not loaded; the service is not ready.",
         )
 
-    vectors = await run_in_threadpool(build_position_vectors, payload, model)
+    try:
+        vectors = await run_in_threadpool(build_position_vectors, payload, model)
+    except Exception as exc:
+        logger.exception(
+            "Embedding generation failed for position %s",
+            payload.position_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Position embedding generation failed.",
+        ) from exc
 
     return PositionEmbedResponse(
         position_id=payload.position_id,
