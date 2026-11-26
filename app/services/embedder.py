@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from typing import TYPE_CHECKING, Any, Literal
 
 from app.schemas.candidate import CandidateMetadata, ParsedCV
@@ -53,6 +54,7 @@ class EmbeddingModel:
 
         self.model_version: str = model_name
         self._uses_e5_prefix: bool = _requires_e5_prefix(model_name)
+        self._encode_lock = threading.Lock()
         self.dimension: int = int(self._model.get_sentence_embedding_dimension())
         if _model is None:
             logger.info(
@@ -83,11 +85,12 @@ class EmbeddingModel:
         if not non_empty_texts:
             return results
 
-        embeddings = self._model.encode(
-            non_empty_texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
+        with self._encode_lock:
+            embeddings = self._model.encode(
+                non_empty_texts,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
         encoded_rows = (
             embeddings.tolist() if hasattr(embeddings, "tolist") else list(embeddings)
         )

@@ -1,3 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -249,3 +253,35 @@ class TestEmbeddingModel:
             model,
         )
         assert vec_a.skills != vec_b.skills
+
+    def test_encode_texts_serializes_concurrent_backend_calls(self):
+        class OverlapTrackingBackend(FakeSentenceTransformer):
+            def __init__(self) -> None:
+                super().__init__(dimension=4)
+                self._counter_lock = threading.Lock()
+                self._active = 0
+                self.max_concurrent = 0
+
+            def encode(self, sentences, *, normalize_embeddings=False, show_progress_bar=False):
+                with self._counter_lock:
+                    self._active += 1
+                    self.max_concurrent = max(self.max_concurrent, self._active)
+                try:
+                    time.sleep(0.01)
+                    return super().encode(
+                        sentences,
+                        normalize_embeddings=normalize_embeddings,
+                        show_progress_bar=show_progress_bar,
+                    )
+                finally:
+                    with self._counter_lock:
+                        self._active -= 1
+
+        backend = OverlapTrackingBackend()
+        model = EmbeddingModel("BAAI/bge-m3", _model=backend)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(model.encode_texts, [[f"text {i}"] for i in range(6)]))
+
+        assert len(results) == 6
+        assert backend.max_concurrent == 1
