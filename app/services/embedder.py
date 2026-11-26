@@ -1,164 +1,147 @@
-"""Faceted embedding generation for candidates and positions.
-
-Loads a sentence-transformer model once (via ``EmbeddingService.load``) and
-generates three L2-normalised vectors per entity — skills, academic, and
-practical — so cosine similarity reduces to a dot product.
-"""
-
 from __future__ import annotations
 
 import logging
-from typing import Any
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from app.schemas.candidate import CandidateMetadata, ParsedCV
 from app.schemas.position import FacetedVectors, PositionEmbedRequest
 
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
+
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Text composition — pure functions, one per (facet × side)
-# ---------------------------------------------------------------------------
-
-_EMPTY_TEXT_PLACEHOLDER = " "
+_PLACEHOLDER = "not specified"
 
 
-def compose_candidate_skills_text(
-    metadata: CandidateMetadata, parsed_cv: ParsedCV
-) -> str:
-    """Combine DB technical_skills with CV-extracted skills."""
-    parts = list(metadata.technical_skills) + list(parsed_cv.skills)
-    return ", ".join(parts)
+class EmbeddingModel:
+    """Thread-safe wrapper around a SentenceTransformer loaded once at startup.
 
-
-def compose_candidate_academic_text(
-    metadata: CandidateMetadata, parsed_cv: ParsedCV
-) -> str:
-    """Combine program, field, major, year-of-study, and education summary."""
-    fragments: list[str] = []
-    for value in (metadata.program, metadata.field, metadata.major):
-        if value:
-            fragments.append(value)
-    if metadata.year_of_study is not None:
-        fragments.append(f"year {metadata.year_of_study}")
-    if parsed_cv.education_summary:
-        fragments.append(parsed_cv.education_summary)
-    return " ".join(fragments)
-
-
-def compose_candidate_practical_text(
-    metadata: CandidateMetadata, parsed_cv: ParsedCV
-) -> str:
-    """Combine experience summary, projects summary, and additional info."""
-    fragments: list[str] = []
-    if parsed_cv.experience_summary:
-        fragments.append(parsed_cv.experience_summary)
-    if parsed_cv.projects_summary:
-        fragments.append(parsed_cv.projects_summary)
-    if metadata.additional_info:
-        fragments.append(metadata.additional_info)
-    return " ".join(fragments)
-
-
-def compose_position_skills_text(request: PositionEmbedRequest) -> str:
-    """Combine required and preferred skills."""
-    parts = list(request.required_skills) + list(request.preferred_skills)
-    return ", ".join(parts)
-
-
-def compose_position_academic_text(request: PositionEmbedRequest) -> str:
-    """Combine target majors and academic level."""
-    fragments: list[str] = []
-    if request.target_majors:
-        fragments.append(", ".join(request.target_majors))
-    if request.academic_level:
-        fragments.append(request.academic_level)
-    return " ".join(fragments)
-
-
-def compose_position_practical_text(request: PositionEmbedRequest) -> str:
-    """Combine responsibilities and experience level."""
-    fragments: list[str] = []
-    if request.responsibilities:
-        fragments.append(request.responsibilities)
-    if request.experience_level:
-        fragments.append(request.experience_level)
-    return " ".join(fragments)
-
-
-# ---------------------------------------------------------------------------
-# Embedding service
-# ---------------------------------------------------------------------------
-
-
-class EmbeddingService:
-    """Thin wrapper around a sentence-transformer model.
-
-    Use the ``load`` classmethod in production.  In tests, construct directly
-    with any object that exposes ``.encode(sentences, ...)`` and
-    ``.get_sentence_embedding_dimension() -> int``.
+    ``normalize_embeddings=True`` is always passed so that cosine similarity
+    reduces to a simple dot product downstream.
     """
 
-    def __init__(self, model: Any, *, model_name: str) -> None:
-        self._model = model
-        self._model_name = model_name
+    def __init__(self, model_name: str) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer as _ST
+        except ImportError as exc:
+            raise RuntimeError(
+                "Embedding support requires sentence-transformers; install it "
+                "with: pip install sentence-transformers"
+            ) from exc
 
-    @classmethod
-    def load(cls, model_name: str) -> EmbeddingService:
-        """Download / load the model from the HuggingFace cache."""
-        from sentence_transformers import SentenceTransformer
+        logger.info("Loading embedding model: %s …", model_name)
+        self._model: SentenceTransformer = _ST(model_name)
+        self.model_version: str = model_name
+        self.dimension: int = self._model.get_sentence_embedding_dimension()
+        logger.info(
+            "Embedding model ready: %s (dimension=%d)", model_name, self.dimension
+        )
 
-        logger.info("Loading sentence-transformer model '%s' …", model_name)
-        model = SentenceTransformer(model_name)
-        return cls(model=model, model_name=model_name)
+    def encode_texts(self, texts: list[str]) -> list[list[float]]:
+        """Encode a batch of texts into L2-normalized vectors."""
 
-    # -- properties ----------------------------------------------------------
-
-    @property
-    def model_version(self) -> str:
-        return self._model_name
-
-    @property
-    def dimension(self) -> int:
-        return int(self._model.get_sentence_embedding_dimension())
-
-    # -- low-level encode ----------------------------------------------------
-
-    def encode(self, texts: list[str]) -> list[list[float]]:
-        """Encode *texts* into L2-normalised vectors (list-of-lists)."""
-        safe = [t if t.strip() else _EMPTY_TEXT_PLACEHOLDER for t in texts]
-        embeddings: np.ndarray = self._model.encode(
-            safe,
+        if not texts:
+            return []
+        embeddings = self._model.encode(
+            texts,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
         return embeddings.tolist()
 
-    # -- high-level faceted embed --------------------------------------------
 
-    def embed_position(self, request: PositionEmbedRequest) -> FacetedVectors:
-        """Generate three aligned vectors for a position."""
-        texts = [
-            compose_position_skills_text(request),
-            compose_position_academic_text(request),
-            compose_position_practical_text(request),
-        ]
-        vectors = self.encode(texts)
-        return FacetedVectors(
-            skills=vectors[0], academic=vectors[1], practical=vectors[2]
-        )
+# ── Text assembly helpers ──────────────────────────────────────────────────
 
-    def embed_candidate(
-        self, metadata: CandidateMetadata, parsed_cv: ParsedCV
-    ) -> FacetedVectors:
-        """Generate three aligned vectors for a candidate."""
-        texts = [
-            compose_candidate_skills_text(metadata, parsed_cv),
-            compose_candidate_academic_text(metadata, parsed_cv),
-            compose_candidate_practical_text(metadata, parsed_cv),
-        ]
-        vectors = self.encode(texts)
-        return FacetedVectors(
-            skills=vectors[0], academic=vectors[1], practical=vectors[2]
-        )
+
+def _join_non_empty(*parts: str) -> str:
+    """Concatenate non-blank strings with a single space separator."""
+
+    return " ".join(p.strip() for p in parts if p and p.strip())
+
+
+# ── Faceted vector builders ────────────────────────────────────────────────
+
+
+def build_candidate_vectors(
+    metadata: CandidateMetadata,
+    parsed_cv: ParsedCV,
+    model: EmbeddingModel,
+) -> FacetedVectors:
+    """Generate three faceted vectors for a candidate.
+
+    Facet 1 — Skills:     db.technical_skills + cv.skills
+    Facet 2 — Academic:   program + field + major + year_of_study + cv.education
+    Facet 3 — Practical:  cv.experience + cv.projects + additional_info
+    """
+
+    # Facet 1
+    skills_text = _join_non_empty(
+        ", ".join(metadata.technical_skills),
+        ", ".join(parsed_cv.skills),
+    )
+
+    # Facet 2
+    academic_parts = [metadata.program, metadata.field, metadata.major]
+    if metadata.year_of_study is not None:
+        academic_parts.append(f"year of study {metadata.year_of_study}")
+    academic_parts.append(parsed_cv.education_summary)
+    academic_text = _join_non_empty(*academic_parts)
+
+    # Facet 3
+    practical_text = _join_non_empty(
+        parsed_cv.experience_summary,
+        parsed_cv.projects_summary,
+        metadata.additional_info,
+    )
+
+    vectors = model.encode_texts([
+        skills_text or _PLACEHOLDER,
+        academic_text or _PLACEHOLDER,
+        practical_text or _PLACEHOLDER,
+    ])
+
+    return FacetedVectors(
+        skills=vectors[0],
+        academic=vectors[1],
+        practical=vectors[2],
+    )
+
+
+def build_position_vectors(
+    position: PositionEmbedRequest,
+    model: EmbeddingModel,
+) -> FacetedVectors:
+    """Generate three faceted vectors for a position.
+
+    Facet 1 — Skills:     required_skills + preferred_skills
+    Facet 2 — Academic:   target_majors + academic_level
+    Facet 3 — Practical:  responsibilities + experience_level
+    """
+
+    skills_text = _join_non_empty(
+        ", ".join(position.required_skills),
+        ", ".join(position.preferred_skills),
+    )
+
+    academic_text = _join_non_empty(
+        ", ".join(position.target_majors),
+        position.academic_level,
+    )
+
+    practical_text = _join_non_empty(
+        position.responsibilities,
+        position.experience_level,
+    )
+
+    vectors = model.encode_texts([
+        skills_text or _PLACEHOLDER,
+        academic_text or _PLACEHOLDER,
+        practical_text or _PLACEHOLDER,
+    ])
+
+    return FacetedVectors(
+        skills=vectors[0],
+        academic=vectors[1],
+        practical=vectors[2],
+    )
